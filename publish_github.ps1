@@ -7,6 +7,12 @@ Set-Location $PSScriptRoot
 $repoName = "wsl-kali-portable-launcher"
 $version = "v1.1.1"
 $desc = "Windows portable WSL Kali Linux GUI launcher (Win-KeX / TigerVNC)"
+$safeDir = "-c", "safe.directory=$((Get-Location).Path -replace '\\','/')"
+
+function Git {
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+    & git @safeDir @Args
+}
 
 Write-Host "GitHub 로그인 확인..."
 gh auth status
@@ -16,13 +22,13 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 if (-not (Test-Path ".git")) {
-    git init
-    git branch -M main
+    Git init
+    Git branch -M main
 }
 
-git add .
+Git add .
 git status
-git commit -m "Release $version - Kali Linux Portable Launcher" 2>$null
+Git commit -m "Release $version - Kali Linux Portable Launcher" 2>$null
 if ($LASTEXITCODE -ne 0) {
     Write-Host "커밋할 변경 없음 또는 이미 커밋됨"
 }

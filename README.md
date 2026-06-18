@@ -97,6 +97,23 @@ exe와 같은 폴더에 생성·편집 가능합니다.
 - WSL2 + Win-KeX 3.x
 - PyInstaller (단일 exe)
 
+## GitHub 배포
+
+```powershell
+# 1. GitHub CLI 로그인 (최초 1회)
+gh auth login
+
+# 2. 레포지토리 생성 + Release 업로드
+.\publish_github.ps1
+```
+
+태그 push 시 GitHub Actions가 exe를 자동 빌드·릴리스합니다.
+
+```bat
+git tag v1.1.1
+git push origin v1.1.1
+```
+
 ## 라이선스
 
 MIT License — [LICENSE](LICENSE)
