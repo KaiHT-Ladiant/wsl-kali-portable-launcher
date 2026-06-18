@@ -97,26 +97,6 @@ Create `kali_launcher_config.json` next to the executable (this file is local an
 - WSL2 + Win-KeX 3.x
 - PyInstaller (single-file executable)
 
-## Publishing to GitHub
-
-```bat
-gh auth login
-publish_github.bat
-```
-
-If PowerShell blocks `.ps1` scripts (execution policy), use the batch file above or run:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\publish_github.ps1
-```
-
-Pushing a version tag triggers GitHub Actions to build and attach the executable to a Release:
-
-```bat
-git tag v1.1.1
-git push origin v1.1.1
-```
-
 ## License
 
 MIT License — see [LICENSE](LICENSE)
