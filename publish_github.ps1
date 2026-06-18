@@ -7,7 +7,7 @@ Set-Location $PSScriptRoot
 $repoName = "wsl-kali-portable-launcher"
 $version = "v1.1.1"
 $desc = "Windows portable WSL Kali Linux GUI launcher (Win-KeX / TigerVNC)"
-$safeDir = "-c", "safe.directory=$((Get-Location).Path -replace '\\','/')"
+$gitSafeDir = "-c", "safe.directory=$((Get-Location).Path -replace '\\','/')"
 
 function Resolve-Tool {
     param(
@@ -60,10 +60,10 @@ if (-not $gitExe) {
 function Invoke-External {
     param(
         [string]$Exe,
-        [string[]]$Args
+        [string[]]$ArgumentList
     )
 
-    $argText = ($Args | ForEach-Object {
+    $argText = ($ArgumentList | ForEach-Object {
         if ($_ -match '\s|"') {
             '"' + ($_.Replace('"', '\"')) + '"'
         } else {
@@ -92,14 +92,14 @@ function Invoke-External {
 }
 
 function Gh {
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$ToolArgs)
 
-    $result = Invoke-External -Exe $ghExe -Args $Args
+    $result = Invoke-External -Exe $ghExe -ArgumentList $ToolArgs
     if ($result.ExitCode -ne 0) {
         if ($result.Error) {
             Write-Host $result.Error
         }
-        throw "gh failed (exit $($result.ExitCode)): gh $($Args -join ' ')"
+        throw "gh failed (exit $($result.ExitCode)): gh $($ToolArgs -join ' ')"
     }
 
     if ($result.Output) {
@@ -108,13 +108,29 @@ function Gh {
 }
 
 function GhTry {
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
-    Invoke-External -Exe $ghExe -Args $Args
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$ToolArgs)
+    Invoke-External -Exe $ghExe -ArgumentList $ToolArgs
+}
+
+function GitTry {
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$ToolArgs)
+    Invoke-External -Exe $gitExe -ArgumentList (@($gitSafeDir) + $ToolArgs)
 }
 
 function Git {
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
-    & $gitExe @safeDir @Args
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$ToolArgs)
+
+    $result = GitTry @ToolArgs
+    if ($result.ExitCode -ne 0) {
+        if ($result.Error) {
+            Write-Host $result.Error
+        }
+        throw "git failed (exit $($result.ExitCode)): git $($ToolArgs -join ' ')"
+    }
+
+    if ($result.Output) {
+        Write-Output $result.Output
+    }
 }
 
 Write-Host "Checking GitHub authentication..."
@@ -147,20 +163,19 @@ if (-not (Test-Path ".git")) {
 
 Git add .
 Git status
-Git commit -m "Release $version" 2>$null
-if ($LASTEXITCODE -ne 0) {
+$commit = GitTry commit -m "Release $version"
+if ($commit.ExitCode -ne 0) {
     Write-Host "Nothing new to commit."
 }
 
-Git remote get-url origin 2>$null | Out-Null
-$hasRemote = ($LASTEXITCODE -eq 0)
+$remoteCheck = GitTry remote get-url origin
+$hasRemote = ($remoteCheck.ExitCode -eq 0) -and $remoteCheck.Output
 
 if (-not $hasRemote) {
     Write-Host "Creating repository: $repoName"
     Gh repo create $repoName --public --source=. --remote=origin --description $desc --push
 } else {
-    $originUrl = Git remote get-url origin
-    Write-Host "Using existing remote: $originUrl"
+    Write-Host "Using existing remote: $($remoteCheck.Output)"
     Git push -u origin main
 }
 
