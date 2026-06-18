@@ -1,5 +1,7 @@
 # Kali Linux Portable Launcher
 
+![Version](https://img.shields.io/badge/Version-1.1.1-blue) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A Windows GUI client for running **WSL Kali Linux** from a portable external SSD.  
 Start and stop Win-KeX (TigerVNC) sessions with one click.
 
