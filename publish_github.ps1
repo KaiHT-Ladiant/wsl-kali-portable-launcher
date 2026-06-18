@@ -57,28 +57,59 @@ if (-not $gitExe) {
     exit 1
 }
 
+function Invoke-External {
+    param(
+        [string]$Exe,
+        [string[]]$Args
+    )
+
+    $argText = ($Args | ForEach-Object {
+        if ($_ -match '\s|"') {
+            '"' + ($_.Replace('"', '\"')) + '"'
+        } else {
+            $_
+        }
+    }) -join ' '
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Exe
+    $psi.Arguments = $argText
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+
+    $process = [System.Diagnostics.Process]::Start($psi)
+    $stdout = $process.StandardOutput.ReadToEnd()
+    $stderr = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+
+    return [PSCustomObject]@{
+        Output   = $stdout.Trim()
+        Error    = $stderr.Trim()
+        ExitCode = $process.ExitCode
+    }
+}
+
 function Gh {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
-    & $ghExe @Args
-    if ($LASTEXITCODE -ne 0) {
-        throw "gh failed (exit $LASTEXITCODE): gh $($Args -join ' ')"
+
+    $result = Invoke-External -Exe $ghExe -Args $Args
+    if ($result.ExitCode -ne 0) {
+        if ($result.Error) {
+            Write-Host $result.Error
+        }
+        throw "gh failed (exit $($result.ExitCode)): gh $($Args -join ' ')"
+    }
+
+    if ($result.Output) {
+        Write-Output $result.Output
     }
 }
 
 function GhTry {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
-
-    $oldNative = $PSNativeCommandUseErrorActionPreference
-    $PSNativeCommandUseErrorActionPreference = $false
-    try {
-        $output = & $ghExe @Args 2>$null
-        return [PSCustomObject]@{
-            Output   = $output
-            ExitCode = $LASTEXITCODE
-        }
-    } finally {
-        $PSNativeCommandUseErrorActionPreference = $oldNative
-    }
+    Invoke-External -Exe $ghExe -Args $Args
 }
 
 function Git {
@@ -87,10 +118,16 @@ function Git {
 }
 
 Write-Host "Checking GitHub authentication..."
-Gh auth status
-if ($LASTEXITCODE -ne 0) {
+$auth = GhTry auth status
+if ($auth.ExitCode -ne 0) {
+    if ($auth.Error) {
+        Write-Host $auth.Error
+    }
     Write-Host "Run first: gh auth login"
     exit 1
+}
+if ($auth.Output) {
+    Write-Host $auth.Output
 }
 
 if (-not (Test-Path "dist\KaliLauncher.exe")) {
@@ -115,14 +152,15 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "Nothing new to commit."
 }
 
-$repoView = GhTry repo view $repoName --json url -q .url
-$remote = if ($repoView.ExitCode -eq 0) { $repoView.Output } else { $null }
+Git remote get-url origin 2>$null | Out-Null
+$hasRemote = ($LASTEXITCODE -eq 0)
 
-if (-not $remote) {
+if (-not $hasRemote) {
     Write-Host "Creating repository: $repoName"
     Gh repo create $repoName --public --source=. --remote=origin --description $desc --push
 } else {
-    Write-Host "Using existing repository: $remote"
+    $originUrl = Git remote get-url origin
+    Write-Host "Using existing remote: $originUrl"
     Git push -u origin main
 }
 
