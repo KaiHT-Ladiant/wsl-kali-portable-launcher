@@ -1,5 +1,5 @@
-# GitHub 배포 스크립트
-# 사전 준비: gh auth login
+# Publish to GitHub
+# Prerequisites: gh auth login
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -9,15 +9,78 @@ $version = "v1.1.1"
 $desc = "Windows portable WSL Kali Linux GUI launcher (Win-KeX / TigerVNC)"
 $safeDir = "-c", "safe.directory=$((Get-Location).Path -replace '\\','/')"
 
-function Git {
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
-    & git @safeDir @Args
+function Resolve-Tool {
+    param(
+        [string]$Name,
+        [string[]]$Candidates
+    )
+
+    $cmd = Get-Command $Name -ErrorAction SilentlyContinue
+    if ($cmd) {
+        return $cmd.Source
+    }
+
+    foreach ($path in $Candidates) {
+        if (Test-Path $path) {
+            $dir = Split-Path $path -Parent
+            if ($env:Path -notlike "*$dir*") {
+                $env:Path = "$dir;$env:Path"
+            }
+            return $path
+        }
+    }
+
+    return $null
 }
 
-Write-Host "GitHub 로그인 확인..."
-gh auth status
+$ghExe = Resolve-Tool -Name "gh" -Candidates @(
+    "$env:ProgramFiles\GitHub CLI\gh.exe",
+    "${env:ProgramFiles(x86)}\GitHub CLI\gh.exe",
+    "$env:LocalAppData\Programs\GitHub CLI\gh.exe"
+)
+
+if (-not $ghExe) {
+    Write-Host "GitHub CLI (gh) not found in PATH."
+    Write-Host "Install: winget install --id GitHub.cli"
+    Write-Host "Then open a new terminal and run: gh auth login"
+    exit 1
+}
+
+$gitExe = Resolve-Tool -Name "git" -Candidates @(
+    "$env:ProgramFiles\Git\cmd\git.exe",
+    "${env:ProgramFiles(x86)}\Git\cmd\git.exe"
+)
+
+if (-not $gitExe) {
+    Write-Host "Git not found in PATH."
+    Write-Host "Install: winget install --id Git.Git"
+    exit 1
+}
+
+function Gh {
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+    & $ghExe @Args
+}
+
+function Git {
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+    & $gitExe @safeDir @Args
+}
+
+Write-Host "Checking GitHub authentication..."
+Gh auth status
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "먼저 실행: gh auth login"
+    Write-Host "Run first: gh auth login"
+    exit 1
+}
+
+if (-not (Test-Path "dist\KaliLauncher.exe")) {
+    Write-Host "Building release executable..."
+    cmd /c build_exe.bat
+}
+
+if (-not (Test-Path "dist\KaliLauncher.exe")) {
+    Write-Host "dist\KaliLauncher.exe not found."
     exit 1
 }
 
@@ -27,41 +90,26 @@ if (-not (Test-Path ".git")) {
 }
 
 Git add .
-git status
-Git commit -m "Release $version - Kali Linux Portable Launcher" 2>$null
+Git status
+Git commit -m "Release $version" 2>$null
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "커밋할 변경 없음 또는 이미 커밋됨"
+    Write-Host "Nothing new to commit."
 }
 
-$remote = gh repo view $repoName --json url -q .url 2>$null
+$remote = Gh repo view $repoName --json url -q .url 2>$null
 if (-not $remote) {
-    Write-Host "GitHub 레포지토리 생성: $repoName"
-    gh repo create $repoName --public --source=. --remote=origin --description $desc --push
+    Write-Host "Creating repository: $repoName"
+    Gh repo create $repoName --public --source=. --remote=origin --description $desc --push
 } else {
-    Write-Host "기존 레포지토리 사용: $remote"
-    git push -u origin main
+    Write-Host "Using existing repository: $remote"
+    Git push -u origin main
 }
 
-if (-not (Test-Path "dist\KaliLauncher.exe")) {
-    Write-Host "dist\KaliLauncher.exe 없음 — build_exe.bat 실행 후 다시 시도"
-    exit 1
-}
-
-Write-Host "GitHub Release 생성: $version"
-gh release create $version `
+Write-Host "Creating GitHub Release: $version"
+Gh release create $version `
     "dist/KaliLauncher.exe" `
-    "dist/kali_icon.ico" `
-    "dist/kali_icon.png" `
     --title "Kali Linux Portable $version" `
-    --notes "## Kali Linux Portable Launcher $version
+    --notes "WSL Kali portable launcher with Win-KeX TigerVNC start/stop and drive auto-detection."
 
-- WSL Kali + Win-KeX TigerVNC 원클릭 시작/정지
-- 외장 SSD 드라이브 자동 감지
-- Kali 아이콘 적용
-
-### 설치
-1. KaliLauncher.exe 를 kali-portable 폴더에 저장
-2. 실행 후 「Kali Linux 시작」"
-
-Write-Host "완료!"
-gh repo view --web
+Write-Host "Done."
+Gh repo view --web

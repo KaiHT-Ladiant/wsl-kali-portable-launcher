@@ -1,80 +1,80 @@
 # Kali Linux Portable Launcher
 
-Windows용 **외장 SSD 포터블 WSL Kali Linux** 실행 GUI 클라이언트입니다.  
-한 번의 클릭으로 WSL Kali + Win-KeX(TigerVNC) 세션을 시작·종료할 수 있습니다.
+A Windows GUI client for running **WSL Kali Linux** from a portable external SSD.  
+Start and stop Win-KeX (TigerVNC) sessions with one click.
 
 ![Kali Linux Portable](kali_icon.png)
 
-## 주요 기능
+## Features
 
-- **Kali Linux 시작** — WSL KeX 서버 기동 + Win-KeX TigerVNC 클라이언트 자동 실행
-- **Kali Linux 정지** — TigerVNC/Win-KeX 프로세스 및 `kex --kill`로 세션 종료
-- **드라이브 문자 자동 감지** — 외장 SSD 드라이브(H:, E: 등) 변경에도 경로 자동 계산
-- **세션 모드 선택** — WIN (TigerVNC), VNC, ESM (RDP)
-- **바탕화면 바로가기** — Kali 아이콘 포함 `.lnk` 생성
-- **최초 WSL 가져오기** — `kali-final.tar` 자동 import (관리자 권한 필요)
+- **Start Kali Linux** — Launch WSL KeX server and Win-KeX TigerVNC client automatically
+- **Stop Kali Linux** — Terminate TigerVNC/Win-KeX processes and run `kex --kill`
+- **Drive-letter auto-detection** — Works when the external SSD is mounted on any drive letter
+- **Session modes** — WIN (TigerVNC), VNC, ESM (RDP)
+- **Desktop shortcut** — Create a `.lnk` with the Kali icon
+- **First-time WSL import** — Optional import from a local tar archive (requires administrator)
 
-## 요구 사항
+## Requirements
 
-| 항목 | 설명 |
-|------|------|
-| OS | Windows 10/11 (WSL2) |
-| WSL | Kali Linux 배포판 (`kali-linux` 등) |
-| Win-KeX | Kali WSL 내 `kex` (Win-KeX 3.x) |
-| Python | exe 사용 시 불필요 / 소스 실행 시 3.10+ |
+| Item | Description |
+|------|-------------|
+| OS | Windows 10/11 with WSL2 |
+| WSL | Kali Linux distribution (e.g. `kali-linux`) |
+| Win-KeX | `kex` inside Kali WSL (Win-KeX 3.x) |
+| Python | Not required when using the release `.exe`; Python 3.10+ for source runs |
 
-## 폴더 구조 (외장 SSD)
+## Recommended folder layout (external SSD)
 
 ```
-D:\0.Kali\                      ← 드라이브 문자는 자유
-├── kali-final.tar                ← WSL 최초 import용 (선택)
+D:\kali-setup\                    <- drive letter may vary
+├── kali-rootfs.tar               <- optional, for first WSL import (not included in repo)
 └── kali-portable\
-    ├── KaliLauncher.exe          ← 릴리스 exe
-    ├── kali_icon.ico
-    └── (WSL ext4.vhdx 등)
+    ├── KaliLauncher.exe          <- from Releases
+    ├── kali_icon.ico             <- optional, for shortcuts
+    └── (WSL ext4.vhdx, etc.)     <- created locally, never committed
 ```
 
-exe를 `kali-portable\dist\` 에 두어도 상위 폴더를 자동 탐색합니다.
+The launcher resolves paths from its own location. Running from `dist\` or the project root both work.
 
-## 빠른 시작
+## Quick start
 
-### 1. Release exe 사용 (권장)
+### Option 1: Release executable (recommended)
 
-1. [Releases](../../releases)에서 `KaliLauncher.exe` 다운로드
-2. `kali-portable` 폴더에 저장
-3. `KaliLauncher.exe` 실행 → **Kali Linux 시작**
+1. Download `KaliLauncher.exe` from [Releases](../../releases)
+2. Place it in your `kali-portable` folder
+3. Run it and click **Start Kali Linux**
 
-### 2. 소스에서 빌드
+### Option 2: Build from source
 
 ```bat
 cd kali-portable
 build_exe.bat
 ```
 
-빌드 결과: `dist\KaliLauncher.exe`
+Output: `dist\KaliLauncher.exe`
 
-### 3. Python으로 직접 실행
+### Option 3: Run with Python
 
 ```bat
 python kali_launcher.py
 ```
 
-## 사용법
+## Usage
 
-1. **세션 모드** 선택 (기본: `win` — TigerVNC)
-2. **Kali Linux 시작** 클릭
-3. TigerVNC(Win-KeX) 창에서 **VNC 비밀번호** 입력  
-   - 최초 1회: WSL에서 `kex --passwd` 로 설정
-4. 종료 시 **Kali Linux 정지** 클릭
+1. Select a **session mode** (default: `win` — TigerVNC)
+2. Click **Start Kali Linux**
+3. Enter your VNC password in the Win-KeX/TigerVNC window  
+   - First time only: set the password inside WSL with `kex --passwd`
+4. Click **Stop Kali Linux** when finished
 
-## 설정 (`kali_launcher_config.json`)
+## Configuration
 
-exe와 같은 폴더에 생성·편집 가능합니다.
+Create `kali_launcher_config.json` next to the executable (this file is local and not part of the repository):
 
 ```json
 {
   "distro_name": "kali-linux",
-  "wsl_user": "Kai_HT",
+  "wsl_user": "your-wsl-username",
   "session_mode": "win",
   "kex_vnc_port": 5901,
   "clean_kex_before_start": true,
@@ -82,43 +82,46 @@ exe와 같은 폴더에 생성·편집 가능합니다.
 }
 ```
 
-## 문제 해결
+## Troubleshooting
 
-| 증상 | 해결 |
-|------|------|
-| TigerVNC 창이 안 뜸 | `kex --passwd` 재설정 후 재시작 |
-| Xfce 알림 오류 | v1.0.7+ 에서 자동 비활성화 (무해) |
-| WSL import 실패 | 관리자 권한으로 실행 |
-| 포트 연결 거부 | `kex_vnc_port` 를 `5901` 로 확인 |
+| Symptom | Action |
+|---------|--------|
+| TigerVNC window does not appear | Run `kex --passwd` in WSL, then restart |
+| Xfce notification daemon error | Harmless; disabled automatically in v1.0.7+ |
+| WSL import fails | Run the launcher as administrator |
+| Connection refused on VNC port | Confirm `kex_vnc_port` is `5901` |
 
-## 기술 스택
+## Tech stack
 
 - Python 3 + Tkinter
 - WSL2 + Win-KeX 3.x
-- PyInstaller (단일 exe)
+- PyInstaller (single-file executable)
 
-## GitHub 배포
+## Publishing to GitHub
 
-```powershell
-# 1. GitHub CLI 로그인 (최초 1회)
+```bat
 gh auth login
-
-# 2. 레포지토리 생성 + Release 업로드
-.\publish_github.ps1
+publish_github.bat
 ```
 
-태그 push 시 GitHub Actions가 exe를 자동 빌드·릴리스합니다.
+If PowerShell blocks `.ps1` scripts (execution policy), use the batch file above or run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\publish_github.ps1
+```
+
+Pushing a version tag triggers GitHub Actions to build and attach the executable to a Release:
 
 ```bat
 git tag v1.1.1
 git push origin v1.1.1
 ```
 
-## 라이선스
+## License
 
-MIT License — [LICENSE](LICENSE)
+MIT License — see [LICENSE](LICENSE)
 
-## 주의
+## Disclaimer
 
-Kali Linux 및 드래곤 로고는 [Kali Linux / Offensive Security](https://www.kali.org/) 의 상표입니다.  
-본 프로젝트는 Kali Linux 공식 프로젝트와 무관한 서드파티 도구입니다.
+Kali Linux and the dragon logo are trademarks of [Kali Linux / Offensive Security](https://www.kali.org/).  
+This project is an unofficial third-party tool and is not affiliated with the Kali Linux project.

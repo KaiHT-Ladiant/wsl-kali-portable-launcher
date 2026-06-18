@@ -29,7 +29,7 @@ from tkinter import messagebox, scrolledtext, ttk
 APP_NAME = "Kali Linux Portable"
 APP_VERSION = "1.1.1"
 DEFAULT_DISTRO = "kali-linux"
-DEFAULT_USER = "Kai_HT"
+DEFAULT_USER = "kali"
 CONFIG_FILENAME = "kali_launcher_config.json"
 ICON_FILENAME = "kali_icon.ico"
 WSL_FOLDER_NAME = "kali-portable"
