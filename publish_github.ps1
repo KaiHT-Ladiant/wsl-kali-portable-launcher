@@ -60,6 +60,25 @@ if (-not $gitExe) {
 function Gh {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
     & $ghExe @Args
+    if ($LASTEXITCODE -ne 0) {
+        throw "gh failed (exit $LASTEXITCODE): gh $($Args -join ' ')"
+    }
+}
+
+function GhTry {
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+
+    $oldNative = $PSNativeCommandUseErrorActionPreference
+    $PSNativeCommandUseErrorActionPreference = $false
+    try {
+        $output = & $ghExe @Args 2>$null
+        return [PSCustomObject]@{
+            Output   = $output
+            ExitCode = $LASTEXITCODE
+        }
+    } finally {
+        $PSNativeCommandUseErrorActionPreference = $oldNative
+    }
 }
 
 function Git {
@@ -96,7 +115,9 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "Nothing new to commit."
 }
 
-$remote = Gh repo view $repoName --json url -q .url 2>$null
+$repoView = GhTry repo view $repoName --json url -q .url
+$remote = if ($repoView.ExitCode -eq 0) { $repoView.Output } else { $null }
+
 if (-not $remote) {
     Write-Host "Creating repository: $repoName"
     Gh repo create $repoName --public --source=. --remote=origin --description $desc --push
@@ -106,10 +127,16 @@ if (-not $remote) {
 }
 
 Write-Host "Creating GitHub Release: $version"
-Gh release create $version `
-    "dist/KaliLauncher.exe" `
-    --title "Kali Linux Portable $version" `
-    --notes "WSL Kali portable launcher with Win-KeX TigerVNC start/stop and drive auto-detection."
+$releaseView = GhTry release view $version
+if ($releaseView.ExitCode -eq 0) {
+    Write-Host "Release $version already exists. Uploading executable..."
+    Gh release upload $version "dist/KaliLauncher.exe" --clobber
+} else {
+    Gh release create $version `
+        "dist/KaliLauncher.exe" `
+        --title "Kali Linux Portable $version" `
+        --notes "WSL Kali portable launcher with Win-KeX TigerVNC start/stop and drive auto-detection."
+}
 
 Write-Host "Done."
 Gh repo view --web
