@@ -7,7 +7,13 @@ Set-Location $PSScriptRoot
 $repoName = "wsl-kali-portable-launcher"
 $version = "v1.1.1"
 $desc = "Windows portable WSL Kali Linux GUI launcher (Win-KeX / TigerVNC)"
-$gitSafeDir = "-c", "safe.directory=$((Get-Location).Path -replace '\\','/')"
+$repoPath = (Resolve-Path $PSScriptRoot).Path -replace '\\', '/'
+$gitSafeDir = "-c", "safe.directory=$repoPath"
+
+# Allow git/gh on external or portable drives without changing global git config.
+$env:GIT_CONFIG_COUNT = "1"
+$env:GIT_CONFIG_KEY_0 = "safe.directory"
+$env:GIT_CONFIG_VALUE_0 = $repoPath
 
 function Resolve-Tool {
     param(
@@ -74,6 +80,7 @@ function Invoke-External {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $Exe
     $psi.Arguments = $argText
+    $psi.WorkingDirectory = $PSScriptRoot
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false
@@ -133,6 +140,32 @@ function Git {
     }
 }
 
+function Ensure-GitRepository {
+    $inside = GitTry rev-parse --is-inside-work-tree
+    if ($inside.ExitCode -ne 0 -or $inside.Output -ne "true") {
+        Write-Host "Initializing local git repository..."
+        Git init
+        Git branch -M main
+    }
+}
+
+function Ensure-GitHubRepository {
+    $repoView = GhTry repo view $repoName --json url -q .url
+    if ($repoView.ExitCode -eq 0 -and $repoView.Output) {
+        return $repoView.Output.Trim()
+    }
+
+    Write-Host "Creating repository: $repoName"
+    Gh repo create $repoName --public --description $desc | Out-Null
+
+    $repoView = GhTry repo view $repoName --json url -q .url
+    if ($repoView.ExitCode -ne 0 -or -not $repoView.Output) {
+        throw "Could not resolve repository URL for $repoName"
+    }
+
+    return $repoView.Output.Trim()
+}
+
 Write-Host "Checking GitHub authentication..."
 $auth = GhTry auth status
 if ($auth.ExitCode -ne 0) {
@@ -156,10 +189,7 @@ if (-not (Test-Path "dist\KaliLauncher.exe")) {
     exit 1
 }
 
-if (-not (Test-Path ".git")) {
-    Git init
-    Git branch -M main
-}
+Ensure-GitRepository
 
 Git add .
 Git status
@@ -169,15 +199,16 @@ if ($commit.ExitCode -ne 0) {
 }
 
 $remoteCheck = GitTry remote get-url origin
-$hasRemote = ($remoteCheck.ExitCode -eq 0) -and $remoteCheck.Output
-
-if (-not $hasRemote) {
-    Write-Host "Creating repository: $repoName"
-    Gh repo create $repoName --public --source=. --remote=origin --description $desc --push
+if ($remoteCheck.ExitCode -ne 0 -or -not $remoteCheck.Output) {
+    $repoUrl = Ensure-GitHubRepository
+    Write-Host "Adding remote origin: $repoUrl"
+    Git remote add origin $repoUrl
 } else {
-    Write-Host "Using existing remote: $($remoteCheck.Output)"
-    Git push -u origin main
+    Write-Host "Using existing remote: $($remoteCheck.Output.Trim())"
 }
+
+Write-Host "Pushing to GitHub..."
+Git push -u origin main
 
 Write-Host "Creating GitHub Release: $version"
 $releaseView = GhTry release view $version
