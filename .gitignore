@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller
+build/
+
+# 로컬 설정 / WSL 데이터 (커밋 금지)
+ext4.vhdx
+*.vhdx
+kali_launcher_config.json
+dist/kali_launcher_config.json
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
