@@ -12,6 +12,10 @@ build/
 
 # Release output (upload via GitHub Releases, not git)
 dist/
+KaliLauncher.exe
+
+# Local debug / terminal captures
+terminals/
 
 # WSL / portable runtime (local only)
 *.tar

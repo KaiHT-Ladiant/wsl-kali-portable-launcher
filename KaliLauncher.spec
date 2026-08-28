@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+
 a = Analysis(
     ['kali_launcher.py'],
     pathex=[],
@@ -34,6 +35,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['kali_icon.ico'],
     version='version_info.txt',
+    icon=['kali_icon.ico'],
 )

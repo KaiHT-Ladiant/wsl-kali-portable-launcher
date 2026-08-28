@@ -1,6 +1,6 @@
 # Kali Linux Portable Launcher
 
-![Version](https://img.shields.io/badge/Version-1.1.1-blue) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Version](https://img.shields.io/badge/Version-1.2.5-blue) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A Windows GUI client for running **WSL Kali Linux** from a portable external SSD.  
 Start and stop Win-KeX (TigerVNC) sessions with one click.
@@ -15,6 +15,8 @@ Start and stop Win-KeX (TigerVNC) sessions with one click.
 - **Session modes** — WIN (TigerVNC), VNC, ESM (RDP)
 - **Desktop shortcut** — Create a `.lnk` with the Kali icon
 - **First-time WSL import** — Optional import from a local tar archive (requires administrator)
+- **Portable SSD recovery** — Detects stale WSL state after drive reconnect and auto-recovers
+- **Safe stop** — Optionally runs `wsl --shutdown` so the SSD can be unplugged cleanly
 
 ## Requirements
 
@@ -92,12 +94,18 @@ Create `kali_launcher_config.json` next to the executable (this file is local an
 | Xfce notification daemon error | Harmless; disabled automatically in v1.0.7+ |
 | WSL import fails | Run the launcher as administrator |
 | Connection refused on VNC port | Confirm `kex_vnc_port` is `5901` |
+| Fails after unplugging external SSD | Use **Stop Kali Linux** first (v1.2.5+ shuts down WSL). If it still fails, restart the launcher — it auto-recovers. |
+| `/tmp/.X11-unix` read-only / VNC never starts | Fixed automatically in v1.2.5 via root remount after WSL health check |
 
 ## Tech stack
 
 - Python 3 + Tkinter
 - WSL2 + Win-KeX 3.x
 - PyInstaller (single-file executable)
+
+## Contributors
+
+See [CONTRIBUTORS.md](CONTRIBUTORS.md). Maintained by [@KaiHT-Ladiant](https://github.com/KaiHT-Ladiant).
 
 ## License
 
