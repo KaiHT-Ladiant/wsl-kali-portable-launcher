@@ -29,7 +29,7 @@ from tkinter import messagebox, scrolledtext, ttk
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Kali Linux Portable"
-APP_VERSION = "1.2.7"
+APP_VERSION = "1.2.8"
 LXSS_REG_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss"
 DEFAULT_DISTRO = "kali-linux"
 DEFAULT_USER = "kali"
@@ -200,6 +200,7 @@ def load_config(paths: dict) -> dict:
         "kex_vnc_port": 5901,
         "kex_display": ":1",
         "kex_server_wait_sec": 35,
+        "kex_desktop_wait_sec": 40,
         "winkex_fullscreen": False,
         "prefer_vcxsrv": False,
         "vnc_ports": [5901, 5902, 5903],
@@ -1143,15 +1144,39 @@ class KaliLauncher:
             return False
         return "WRITABLE" in (check.stdout or "")
 
-    def _fix_x11_unix_root(self) -> bool:
-        fix_script = (
-            "if touch /tmp/.X11-unix/.kex_w 2>/dev/null; then "
-            "rm -f /tmp/.X11-unix/.kex_w; echo OK; exit 0; fi; "
-            "mount -o remount,rw /tmp/.X11-unix 2>/dev/null || true; "
-            "if touch /tmp/.X11-unix/.kex_w 2>/dev/null; then "
-            "rm -f /tmp/.X11-unix/.kex_w; echo REMOUNT_OK; exit 0; fi; "
-            "echo FAIL; exit 1"
-        )
+    def _fix_x11_unix_root(self, *, force_recreate: bool = False) -> bool:
+        """
+        WSLg often mounts /tmp/.X11-unix read-only (or as a symlink to /mnt/wslg).
+        Remount helps sometimes; recreating a real 1777 directory is the reliable fix
+        when VNC connects but the XFCE desktop stays blank/black.
+        """
+        if force_recreate:
+            fix_script = (
+                "umount /tmp/.X11-unix 2>/dev/null || true; "
+                "rm -rf /tmp/.X11-unix; "
+                "mkdir -p /tmp/.X11-unix; "
+                "chmod 1777 /tmp/.X11-unix; "
+                "chown root:root /tmp/.X11-unix; "
+                "if touch /tmp/.X11-unix/.kex_w 2>/dev/null; then "
+                "rm -f /tmp/.X11-unix/.kex_w; echo RECREATE_OK; exit 0; fi; "
+                "echo FAIL; exit 1"
+            )
+        else:
+            fix_script = (
+                "if [ -e /tmp/.X11-unix ] && touch /tmp/.X11-unix/.kex_w 2>/dev/null; then "
+                "rm -f /tmp/.X11-unix/.kex_w; echo OK; exit 0; fi; "
+                "mount -o remount,rw /tmp/.X11-unix 2>/dev/null || true; "
+                "if touch /tmp/.X11-unix/.kex_w 2>/dev/null; then "
+                "rm -f /tmp/.X11-unix/.kex_w; echo REMOUNT_OK; exit 0; fi; "
+                "umount /tmp/.X11-unix 2>/dev/null || true; "
+                "rm -rf /tmp/.X11-unix; "
+                "mkdir -p /tmp/.X11-unix; "
+                "chmod 1777 /tmp/.X11-unix; "
+                "chown root:root /tmp/.X11-unix; "
+                "if touch /tmp/.X11-unix/.kex_w 2>/dev/null; then "
+                "rm -f /tmp/.X11-unix/.kex_w; echo RECREATE_OK; exit 0; fi; "
+                "echo FAIL; exit 1"
+            )
         fix = self._run(
             [
                 "wsl",
@@ -1169,10 +1194,10 @@ class KaliLauncher:
             timeout=45.0,
         )
         out = (fix.stdout or "").strip()
-        if fix.returncode == 0 and ("OK" in out or "REMOUNT_OK" in out):
+        if fix.returncode == 0 and any(token in out for token in ("OK", "REMOUNT_OK", "RECREATE_OK")):
             self.log(f"  → X11 소켓 준비 완료 ({out or 'ok'})")
             return True
-        self.log(f"  → X11 remount 실패: {out or fix.stderr}")
+        self.log(f"  → X11 소켓 수정 실패: {out or fix.stderr}")
         return False
 
     def prepare_x11_unix(self) -> bool:
@@ -1185,7 +1210,7 @@ class KaliLauncher:
             self.log("  → /tmp/.X11-unix 쓰기 가능")
             return True
 
-        self.log("  → 읽기 전용 — root로 remount (sudo 암호 입력 없음)")
+        self.log("  → 읽기 전용/WSLg 마운트 — root로 복구 (sudo 암호 입력 없음)")
         if self._fix_x11_unix_root():
             return True
 
@@ -1194,6 +1219,48 @@ class KaliLauncher:
             if self.recover_wsl() and self._fix_x11_unix_root():
                 return True
 
+        return False
+
+    def wait_for_kex_desktop(self) -> bool:
+        """
+        Port 5901 can accept VNC before XFCE finishes starting.
+        Connecting early looks like 'connected but blank screen'.
+        """
+        wait_sec = float(self.config.get("kex_desktop_wait_sec", 40))
+        self.log(f"XFCE 데스크톱 준비 대기 중... (최대 {wait_sec:.0f}초)")
+        script = (
+            "for i in $(seq 1 "
+            + str(max(1, int(wait_sec)))
+            + "); do "
+            "if pgrep -u \"$USER\" -x xfce4-session >/dev/null 2>&1 "
+            "|| pgrep -u \"$USER\" -x xfwm4 >/dev/null 2>&1 "
+            "|| pgrep -u \"$USER\" -x xfdesktop >/dev/null 2>&1; then "
+            "echo DESKTOP_OK; exit 0; fi; "
+            "sleep 1; "
+            "done; "
+            "echo DESKTOP_MISSING; exit 1"
+        )
+        result = self._run(
+            [
+                "wsl",
+                "--cd",
+                "~",
+                "-d",
+                self.config["distro_name"],
+                "-u",
+                self.config["wsl_user"],
+                "--",
+                "bash",
+                "-lc",
+                script,
+            ],
+            timeout=wait_sec + 15.0,
+        )
+        out = (result.stdout or "").strip()
+        if "DESKTOP_OK" in out:
+            self.log("  → XFCE 세션 감지됨")
+            return True
+        self.log("  → XFCE 세션이 아직 없습니다 (VNC만 열린 검정 화면일 수 있음)")
         return False
 
     def detect_and_start_xserver(self) -> None:
@@ -1364,7 +1431,10 @@ class KaliLauncher:
             server_args.append("-s")
 
         # Avoid sudo password hang inside kex (read-only /tmp/.X11-unix).
-        self.prepare_x11_unix()
+        # Prefer a real writable dir over a half-broken WSLg mount.
+        if not self.prepare_x11_unix():
+            self.log("경고: /tmp/.X11-unix 복구 실패 — 검정 화면이 날 수 있어 강제 재생성을 재시도합니다.")
+            self._fix_x11_unix_root()
 
         port = int(self.config.get("kex_vnc_port", 5901))
         wait_sec = float(self.config.get("kex_server_wait_sec", 35))
@@ -1382,15 +1452,27 @@ class KaliLauncher:
                 return False
 
             self.log(f"VNC 서버 대기 중... (localhost:{port}, 최대 {wait_sec:.0f}초)")
-            if wait_for_tcp_port("127.0.0.1", port, wait_sec):
-                self.log(f"  → VNC 서버 준비 완료 (포트 {port})")
-                return self._launch_winkex_client()
+            if not wait_for_tcp_port("127.0.0.1", port, wait_sec):
+                self.log(f"  → 포트 {port} 응답 없음")
+                if attempt == 1:
+                    self.log("  → X11 소켓 재준비 후 한 번 더 시도합니다...")
+                    self._run(self._build_wsl_kex_cmd(["--kill"]), timeout=45.0)
+                    self._fix_x11_unix_root()
+                continue
 
-            self.log(f"  → 포트 {port} 응답 없음")
-            if attempt == 1:
-                self.log("  → X11 소켓 재준비 후 한 번 더 시도합니다...")
+            self.log(f"  → VNC 서버 준비 완료 (포트 {port})")
+            if not self.wait_for_kex_desktop():
+                self.log("  → 데스크톱 미기동 — X11 소켓 강제 재생성 후 KeX 재시작")
                 self._run(self._build_wsl_kex_cmd(["--kill"]), timeout=45.0)
-                self.prepare_x11_unix()
+                self._fix_x11_unix_root(force_recreate=True)
+                if attempt == 1:
+                    continue
+                self.log("힌트: WSL에서 아래를 실행해 보세요.")
+                self.log("  kex --kill")
+                self.log("  sudo bash -c 'umount /tmp/.X11-unix 2>/dev/null; rm -rf /tmp/.X11-unix; mkdir -p /tmp/.X11-unix; chmod 1777 /tmp/.X11-unix'")
+                self.log("  unset WAYLAND_DISPLAY WAYLAND_SOCKET; kex --win -s")
+                # Still launch viewer so the user can see whatever is on the session.
+            return self._launch_winkex_client()
 
         self.log("오류: VNC 서버가 시작되지 않아 클라이언트를 실행하지 않습니다.")
         self.log("힌트: WSL에서 /tmp/.X11-unix 가 쓰기 가능해야 합니다.")
