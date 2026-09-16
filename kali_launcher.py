@@ -29,7 +29,7 @@ from tkinter import messagebox, scrolledtext, ttk
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Kali Linux Portable"
-APP_VERSION = "1.2.10"
+APP_VERSION = "1.2.11"
 LXSS_REG_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss"
 DEFAULT_DISTRO = "kali-linux"
 DEFAULT_USER = "kali"
@@ -210,6 +210,7 @@ def load_config(paths: dict) -> dict:
         "fix_xfce_notifyd": True,
         "recover_wsl_on_start": True,
         "shutdown_wsl_on_stop": True,
+        "auto_install_winkex": False,
         "vcxsrv_extra_args": [":0", "-multiwindow", "-clipboard", "-primary", "-wgl", "-dpi", "auto"],
     }
     cfg_path = paths["config_path"]
@@ -1071,11 +1072,19 @@ class KaliLauncher:
 
     def ensure_winkex_installed(self) -> bool:
         """
-        Portable images sometimes lose kali-win-kex files after a bad HCS/SSD move.
-        Without /usr/lib/win-kex/xstartup, kex --win starts nothing on :5901.
+        Verify Win-KeX files inside the existing portable VHDX.
+        Never deletes/replaces ext4.vhdx. Never downloads a new Kali distro.
+        apt install is opt-in only (auto_install_winkex=true).
         """
-        self.log("Win-KeX 구성 파일 확인 중...")
+        self.log("Win-KeX 구성 확인 (기존 VHDX 유지 · 새 Kali 다운로드 없음)")
         check = (
+            "echo '--- paths ---'; "
+            "ls -la /usr/bin/kex /usr/lib/win-kex /usr/lib/win-kex/xstartup "
+            "/usr/lib/win-kex/TigerVNC/win-kex-win-x64 2>&1 | head -40; "
+            "echo '--- xstartup detail ---'; "
+            "file /usr/lib/win-kex/xstartup 2>&1 || true; "
+            "stat /usr/lib/win-kex/xstartup 2>&1 || true; "
+            "readlink -f /usr/lib/win-kex/xstartup 2>&1 || true; "
             "missing=''; "
             "test -x /usr/bin/kex || missing=\"$missing kex\"; "
             "test -f /usr/lib/win-kex/xstartup || missing=\"$missing xstartup\"; "
@@ -1084,9 +1093,7 @@ class KaliLauncher:
             "if command -v Xtigervnc >/dev/null 2>&1 || test -x /usr/bin/Xtigervnc; then "
             "true; else missing=\"$missing Xtigervnc\"; fi; "
             "if [ -z \"$missing\" ]; then echo WINKEX_OK; "
-            "else echo WINKEX_MISSING:$missing; "
-            "ls -ld /usr/lib/win-kex /usr/lib/win-kex/xstartup /usr/bin/kex 2>&1 | head -20; "
-            "fi"
+            "else echo WINKEX_MISSING:$missing; fi"
         )
         result = self._run(
             [
@@ -1105,12 +1112,22 @@ class KaliLauncher:
             timeout=45.0,
         )
         out = (result.stdout or "").strip()
+        if out:
+            self.log(out[-1200:])
         if "WINKEX_OK" in out:
-            self.log("  → Win-KeX 구성 정상")
+            self.log("  → Win-KeX 구성 정상 (VHDX 내용 유지)")
             return True
 
-        self.log(f"  → Win-KeX 누락/손상: {out or result.stderr or '(출력 없음)'}")
-        self.log("  → kali-win-kex 자동 설치 시도 (네트워크 필요, 수 분 소요 가능)...")
+        self.log("  → Win-KeX 파일이 이 VHDX 안에서 확인되지 않습니다.")
+        self.log("  → 새 Kali를 받지 않습니다. ext4.vhdx도 삭제/교체하지 않습니다.")
+        if not self.config.get("auto_install_winkex", False):
+            self.log("힌트: 노트북과 같은 VHDX면 이 PC의 마운트/캐시 문제일 수 있습니다.")
+            self.log("  wsl --shutdown 후 다시 시작하세요.")
+            self.log("  패키지만 깨졌을 때만 VHDX 안에서: sudo apt install -y kali-win-kex")
+            self.log("  자동 apt를 쓰려면 config에 \"auto_install_winkex\": true")
+            return False
+
+        self.log("  → auto_install_winkex=true — 같은 VHDX 안에 패키지만 설치")
         install = self._run(
             [
                 "wsl",
@@ -1130,13 +1147,9 @@ class KaliLauncher:
         )
         install_out = f"{install.stdout}\n{install.stderr}".strip()
         if "INSTALL_OK" in install_out:
-            self.log("  → kali-win-kex 설치 완료")
+            self.log("  → kali-win-kex 설치 완료 (VHDX 교체 없음)")
             return True
-
-        self.log("오류: Win-KeX가 이 Kali에 없습니다. VNC(5901)가 뜨지 않는 직접 원인입니다.")
-        self.log("노트북에선 되고 이 PC에서만 안 될 때: 이미지 손상 또는 패키지 누락일 수 있습니다.")
-        self.log("WSL에서 수동 설치:")
-        self.log("  sudo apt update && sudo apt install -y kali-win-kex")
+        self.log("오류: Win-KeX 복구 실패. VHDX는 그대로 두었습니다.")
         if install_out:
             self.log(f"설치 출력:\n{install_out[-800:]}")
         return False
@@ -1187,7 +1200,9 @@ class KaliLauncher:
         # Patch system Win-KeX xstartup once so VNC session unsets Wayland.
         patch = (
             "f=/usr/lib/win-kex/xstartup; "
-            "if [ ! -f \"$f\" ]; then echo NO_XSTARTUP; exit 0; fi; "
+            "echo \"probe: $(ls -la \"$f\" 2>&1)\"; "
+            "if [ ! -e \"$f\" ]; then echo NO_XSTARTUP; exit 0; fi; "
+            "if [ ! -f \"$f\" ]; then echo NOT_REGULAR_FILE; exit 0; fi; "
             "if grep -q 'unset WAYLAND_DISPLAY' \"$f\"; then echo ALREADY; exit 0; fi; "
             "cp -a \"$f\" \"$f.bak-portable\"; "
             "awk 'BEGIN{done=0} "
@@ -1217,6 +1232,8 @@ class KaliLauncher:
         )
         out = (patch_result.stdout or "").strip()
         self.log(f"  → Win-KeX xstartup: {out or patch_result.stderr or 'ok'}")
+        if "NO_XSTARTUP" in out or "NOT_REGULAR_FILE" in out:
+            self.log("  → xstartup 패치 건너뜀 (VHDX 삭제/재다운로드 없음). VNC 기동은 계속 시도합니다.")
 
     def _x11_unix_writable(self) -> bool:
         check = self._run(
@@ -1420,8 +1437,89 @@ class KaliLauncher:
             inner,
         ]
 
+    def _wsl_ipv4(self) -> str | None:
+        result = self._run(
+            [
+                "wsl",
+                "-d",
+                self.config["distro_name"],
+                "-u",
+                self.config["wsl_user"],
+                "--",
+                "bash",
+                "-lc",
+                "hostname -I 2>/dev/null | tr ' ' '\\n' | awk -F. 'NF==4{print; exit}'",
+            ],
+            timeout=20.0,
+        )
+        ip = (result.stdout or "").strip().splitlines()
+        return ip[0].strip() if ip else None
+
+    def _peek_kex_start_log(self) -> str:
+        result = self._run(
+            [
+                "wsl",
+                "--cd",
+                "~",
+                "-d",
+                self.config["distro_name"],
+                "-u",
+                self.config["wsl_user"],
+                "--",
+                "bash",
+                "-lc",
+                "tail -n 40 \"$HOME/.cache/kali-launcher/kex-start.log\" 2>/dev/null || true",
+            ],
+            timeout=20.0,
+        )
+        return (result.stdout or "").strip()
+
+    def _wait_for_vnc_port(self, port: int, wait_sec: float) -> bool:
+        """
+        Prefer localhost; if this PC's WSL localhost forwarding is broken,
+        fall back to the distro eth0 IP (common laptop-vs-desktop difference).
+        """
+        wait_sec = max(float(wait_sec), 45.0)
+        hosts = ["127.0.0.1"]
+        wsl_ip = self._wsl_ipv4()
+        if wsl_ip:
+            hosts.append(wsl_ip)
+            self.log(f"  → WSL IP: {wsl_ip}")
+
+        self.log(f"VNC 서버 대기 중... ({'/'.join(hosts)}:{port}, 최대 {wait_sec:.0f}초)")
+        deadline = time.time() + wait_sec
+        last_peek = 0.0
+        while time.time() < deadline:
+            for host in hosts:
+                try:
+                    with socket.create_connection((host, int(port)), timeout=1.0):
+                        self.log(f"  → VNC 응답: {host}:{port}")
+                        if host != "127.0.0.1":
+                            self.config["vnc_host"] = host
+                            self.log(
+                                "  → 이 PC는 localhost 포워딩이 약합니다. "
+                                "클라이언트를 WSL IP로 연결합니다."
+                            )
+                        return True
+                except OSError:
+                    pass
+            now = time.time()
+            if now - last_peek >= 8.0:
+                last_peek = now
+                peek = self._peek_kex_start_log()
+                if peek:
+                    lowered = peek.lower()
+                    if any(
+                        token in lowered
+                        for token in ("error", "failed", "cannot", "denied", "no such", "실패")
+                    ):
+                        self.log("  → kex 로그에서 오류 감지:")
+                        self.log(peek[-600:])
+            time.sleep(0.4)
+        return False
+
     def _diagnose_kex_server_failure(self) -> None:
-        self.log("VNC 서버 실패 진단 중...")
+        self.log("VNC 서버 실패 진단 중... (VHDX 재다운로드 아님)")
         script = (
             "echo '--- kex --status ---'; "
             "kex --status 2>&1 || true; "
@@ -1434,7 +1532,9 @@ class KaliLauncher:
             "ls -la /usr/lib/win-kex/xstartup /usr/bin/kex 2>&1 || true; "
             "echo '--- kex-start.log ---'; "
             "tail -n 80 \"$HOME/.cache/kali-launcher/kex-start.log\" 2>/dev/null || "
-            "echo '(no log)'"
+            "echo '(no log)'; "
+            "echo '--- ip ---'; "
+            "hostname -I 2>/dev/null || true"
         )
         result = self._run(
             [
@@ -1454,7 +1554,21 @@ class KaliLauncher:
         )
         detail = (result.stdout or result.stderr or "").strip()
         if detail:
-            self.log(detail[-1500:])
+            self.log(detail[-1800:])
+        wslconfig = os.path.join(os.environ.get("USERPROFILE", ""), ".wslconfig")
+        if os.path.isfile(wslconfig):
+            try:
+                text = open(wslconfig, encoding="utf-8", errors="ignore").read()
+            except OSError:
+                text = ""
+            if "localhostforwarding" in text.lower() and "false" in text.lower():
+                self.log("힌트: %USERPROFILE%\\.wslconfig 에 localhostForwarding=false 가 있습니다.")
+                self.log("  [wsl2] localhostForwarding=true 로 바꾼 뒤 wsl --shutdown 하세요.")
+        else:
+            self.log("힌트: localhost 포워딩 문제가 의심되면 %USERPROFILE%\\.wslconfig 에")
+            self.log("  [wsl2]")
+            self.log("  localhostForwarding=true")
+            self.log("  를 넣고 wsl --shutdown 후 다시 시도하세요.")
 
 
     def _stage_winkex_files_local(self) -> tuple[str | None, str | None]:
@@ -1648,7 +1762,8 @@ class KaliLauncher:
             self.prepare_x11_unix()
 
         port = int(self.config.get("kex_vnc_port", 5901))
-        wait_sec = float(self.config.get("kex_server_wait_sec", 60))
+        # Local config may set 25s; portable/external SSD often needs longer.
+        wait_sec = max(float(self.config.get("kex_server_wait_sec", 60)), 45.0)
 
         for attempt in (1, 2):
             cmd = self._build_wsl_kex_cmd(server_args, capture_log=True)
@@ -1662,8 +1777,7 @@ class KaliLauncher:
                 self.log(f"서버 시작 실패: {exc}")
                 return False
 
-            self.log(f"VNC 서버 대기 중... (localhost:{port}, 최대 {wait_sec:.0f}초)")
-            if not wait_for_tcp_port("127.0.0.1", port, wait_sec):
+            if not self._wait_for_vnc_port(port, wait_sec):
                 self.log(f"  → 포트 {port} 응답 없음")
                 self._diagnose_kex_server_failure()
                 if attempt == 1:
@@ -1687,9 +1801,8 @@ class KaliLauncher:
             return self._launch_winkex_client()
 
         self.log("오류: VNC 서버가 시작되지 않아 클라이언트를 실행하지 않습니다.")
-        self.log("힌트: Win-KeX 패키지(xstartup)와 /tmp/.X11-unix 쓰기 가능 여부를 확인하세요.")
+        self.log("힌트: 새 Kali를 받는 문제가 아닙니다. 같은 VHDX + 이 PC의 WSL 네트워크/X11을 의심하세요.")
         return False
-
     def _start_kex_simple(self, kex_args: list[str]) -> bool:
         cmd = self._build_wsl_kex_cmd(kex_args)
         self.log(f"Win-KeX 시작: {' '.join(kex_args)}")
@@ -1778,6 +1891,7 @@ class KaliLauncher:
             if vhdx:
                 self.log(f"VHDX: {vhdx} (보존)")
             self.log(f"배포판: {self.config['distro_name']} / 사용자: {self.config['wsl_user']}")
+            self.log("알림: ext4.vhdx 를 삭제/교체하거나 새 Kali를 받지 않습니다. 외장 SSD의 그 환경을 그대로 씁니다.")
             self.log("알림: 시작 중 탐색기에서 \\\\wsl$ / Linux 아이콘 / ext4.vhdx 를 열지 마세요.")
             self.log("알림: 외장 SSD의 VHDX는 첫 기동이 느릴 수 있습니다. 명령이 길면 HCS 대기일 수 있습니다.")
 
