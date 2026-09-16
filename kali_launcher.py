@@ -11,6 +11,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -28,7 +29,8 @@ from tkinter import messagebox, scrolledtext, ttk
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Kali Linux Portable"
-APP_VERSION = "1.2.5"
+APP_VERSION = "1.2.14"
+LXSS_REG_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss"
 DEFAULT_DISTRO = "kali-linux"
 DEFAULT_USER = "kali"
 CONFIG_FILENAME = "kali_launcher_config.json"
@@ -197,7 +199,8 @@ def load_config(paths: dict) -> dict:
         "auto_launch_vnc_viewer": False,
         "kex_vnc_port": 5901,
         "kex_display": ":1",
-        "kex_server_wait_sec": 35,
+        "kex_server_wait_sec": 60,
+        "kex_desktop_wait_sec": 40,
         "winkex_fullscreen": False,
         "prefer_vcxsrv": False,
         "vnc_ports": [5901, 5902, 5903],
@@ -207,6 +210,7 @@ def load_config(paths: dict) -> dict:
         "fix_xfce_notifyd": True,
         "recover_wsl_on_start": True,
         "shutdown_wsl_on_stop": True,
+        "auto_install_winkex": False,
         "vcxsrv_extra_args": [":0", "-multiwindow", "-clipboard", "-primary", "-wgl", "-dpi", "auto"],
     }
     cfg_path = paths["config_path"]
@@ -273,6 +277,30 @@ def wait_for_path(path: str, timeout: float = 20.0) -> bool:
             pass
         time.sleep(0.4)
     return False
+
+
+def windows_path_to_wsl_mnt(path: str) -> str:
+    """C:\\Users\\a\\b -> /mnt/c/Users/a/b (for wsl cp, avoids \\\\wsl$)."""
+    raw = (path or "").strip().strip('"')
+    normalized = raw.replace("/", "\\")
+    match = re.match(r"^\\\\[?]\\([A-Za-z]):\\(.*)$", normalized)
+    if match:
+        letter = match.group(1).lower()
+        tail = match.group(2).replace("\\", "/")
+        return f"/mnt/{letter}/{tail}"
+    match = re.match(r"^([A-Za-z]):\\(.*)$", normalized)
+    if match:
+        letter = match.group(1).lower()
+        tail = match.group(2).replace("\\", "/")
+        return f"/mnt/{letter}/{tail}"
+    # Last resort for unusual paths (should not happen on Windows launcher runs).
+    abs_path = os.path.abspath(raw)
+    drive, tail = os.path.splitdrive(abs_path)
+    letter = drive.rstrip(":\\/").lower() or "c"
+    unix_tail = tail.replace("\\", "/")
+    if not unix_tail.startswith("/"):
+        unix_tail = "/" + unix_tail
+    return f"/mnt/{letter}{unix_tail}"
 
 
 def shell_execute(path: str, params: str, cwd: str | None = None) -> bool:
@@ -411,28 +439,139 @@ class RunResult:
 
 
 def decode_subprocess_output(data: bytes | str | None) -> str:
-    """WSL 명령 출력은 Windows에서 UTF-16 LE인 경우가 많음."""
+    """
+    WSL/콘솔 출력 디코딩.
+    wsl.exe는 UTF-16 LE를 쓰는 경우가 많고, 한글 Windows 메시지는
+    두 번째 바이트가 0이 아니라 기존 ASCII 휴리스틱만으로는 깨진다.
+    """
     if not data:
         return ""
     if isinstance(data, str):
         return data.replace("\x00", "").strip()
 
     if data.startswith(b"\xff\xfe"):
-        return data.decode("utf-16").strip()
+        return data.decode("utf-16").replace("\x00", "").strip()
     if data.startswith(b"\xfe\xff"):
-        return data.decode("utf-16-be").strip()
-    if len(data) >= 2 and data[1:2] == b"\x00":
-        try:
-            return data.decode("utf-16-le").replace("\x00", "").strip()
-        except UnicodeDecodeError:
-            pass
+        return data.decode("utf-16-be").replace("\x00", "").strip()
 
-    for encoding in ("utf-8", "cp949"):
+    candidates: list[str] = []
+    encodings: list[str] = []
+    null_ratio = data.count(0) / max(1, len(data))
+    if len(data) % 2 == 0 and null_ratio >= 0.05:
+        encodings.append("utf-16-le")
+    encodings.extend(["utf-8", "cp949"])
+    if "utf-16-le" not in encodings and len(data) % 2 == 0:
+        encodings.append("utf-16-le")
+
+    for encoding in encodings:
         try:
-            return data.decode(encoding).strip()
+            text = data.decode(encoding)
         except UnicodeDecodeError:
+            text = data.decode(encoding, errors="replace")
+        candidates.append(text.replace("\x00", "").strip())
+
+    if not candidates:
+        return data.decode("utf-8", errors="replace").replace("\x00", "").strip()
+
+    def _score(text: str) -> tuple[int, int]:
+        replacement = text.count("\ufffd")
+        controls = sum(1 for ch in text if ord(ch) < 32 and ch not in "\r\n\t")
+        hangul = sum(1 for ch in text if "\uac00" <= ch <= "\ud7a3")
+        printable = sum(1 for ch in text if ch.isprintable() or ch in "\r\n\t")
+        return (-(replacement + controls), hangul + printable)
+
+    return max(candidates, key=_score)
+
+
+def normalize_wsl_base_path(path: str | None) -> str:
+    """Compare BasePath values across \\\\?\\ prefixes and drive-letter case."""
+    value = (path or "").strip().strip('"')
+    if value.startswith("\\\\?\\"):
+        value = value[4:]
+    if not value:
+        return ""
+    return os.path.normcase(os.path.normpath(value))
+
+
+def format_wsl_base_path(path: str) -> str:
+    normalized = os.path.normpath(path)
+    if normalized.startswith("\\\\?\\"):
+        return normalized
+    return "\\\\?\\" + normalized
+
+
+def parse_lxss_registry_output(text: str) -> list[dict]:
+    """Parse `reg query HKCU\\...\\Lxss /s` into distro entries."""
+    entries: list[dict] = []
+    current: dict | None = None
+
+    def _flush() -> None:
+        nonlocal current
+        if current and current.get("guid") and current.get("name"):
+            entries.append(current)
+        current = None
+
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
             continue
-    return data.decode("utf-8", errors="replace").strip()
+        if line.startswith("HKEY_") or line.startswith("HKCU"):
+            _flush()
+            tail = line.rstrip("\\").split("\\")[-1]
+            current = {
+                "guid_key": line,
+                "guid": tail if tail.startswith("{") and tail.endswith("}") else None,
+                "name": None,
+                "base_path": None,
+            }
+            continue
+        if current is None:
+            continue
+        match = re.match(r"^(\S+)\s+REG_\w+\s+(.*)$", line)
+        if not match:
+            continue
+        key = match.group(1)
+        value = match.group(2)
+        key_l = key.lower()
+        if key_l == "distributionname":
+            current["name"] = value
+        elif key_l == "basepath":
+            current["base_path"] = value
+    _flush()
+    return entries
+
+
+def list_wsl_registry_distros() -> list[dict]:
+    result = run_command(["reg", "query", LXSS_REG_KEY, "/s"], timeout=30)
+    if result.returncode != 0 and not (result.stdout or "").strip():
+        return []
+    return parse_lxss_registry_output(result.stdout or "")
+
+
+def get_wsl_registry_entry(distro_name: str) -> dict | None:
+    target = (distro_name or "").lower()
+    for entry in list_wsl_registry_distros():
+        if (entry.get("name") or "").lower() == target:
+            return entry
+    return None
+
+
+def set_wsl_registry_base_path(guid_key: str, install_dir: str) -> RunResult:
+    return run_command(
+        [
+            "reg",
+            "add",
+            guid_key,
+            "/v",
+            "BasePath",
+            "/t",
+            "REG_SZ",
+            "/d",
+            format_wsl_base_path(install_dir),
+            "/f",
+        ],
+        timeout=30,
+    )
 
 
 def safe_windows_cwd() -> str:
@@ -699,8 +838,85 @@ class KaliLauncher:
             "read-only file system",
             "cannot remove",
             "device or resource busy",
+            "cannot find the path",
+            "cannot find the file",
+            "the system cannot find",
+            "access is denied",
+            "device not ready",
+            "not a valid",
+            "거부되었습니다",
+            "경로를 찾을 수 없",
+            "파일을 찾을 수 없",
+            "디스크가 없습니다",
+            "장치를 찾을 수 없",
+            "error code",
+            "오류 코드",
+            "hcs_",
+            "wsl_e_",
+            "0x800",
+            "connection_timeout",
+            "시간이 초과",
+            "응답을 받지 못",
+            "operation timed out",
+            "timed out",
         )
         return any(marker in lowered for marker in markers)
+
+    def _is_hcs_timeout(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        return any(
+            token in lowered
+            for token in (
+                "hcs_e_connection_timeout",
+                "connection_timeout",
+                "응답을 받지 못",
+                "시간이 초과",
+                "operation timed out",
+            )
+        )
+
+    def sync_portable_base_path(self) -> bool:
+        """
+        외장 SSD를 다른 PC에 꽂거나 드라이브 문자가 바뀌면
+        HKCU Lxss BasePath가 옛 경로를 가리켜 배포판이 뜨지 않는다.
+        VHDX는 삭제/unregister 하지 않고 BasePath만 현재 폴더로 맞춘다.
+        """
+        install_dir = self.paths["wsl_install_dir"]
+        vhdx_path = find_vhdx(install_dir)
+        if not vhdx_path or not self.wsl_distro_exists():
+            return True
+
+        entry = get_wsl_registry_entry(self.config["distro_name"])
+        if not entry or not entry.get("guid_key"):
+            self.log("경고: WSL 목록에는 있으나 레지스트리 BasePath를 찾지 못했습니다.")
+            return True
+
+        registered = normalize_wsl_base_path(entry.get("base_path"))
+        expected = normalize_wsl_base_path(install_dir)
+        registered_vhdx = os.path.join(registered, VHDX_FILENAME) if registered else ""
+        registered_ok = bool(registered) and os.path.isfile(registered_vhdx)
+
+        if registered == expected and registered_ok:
+            return True
+
+        self.log("WSL 등록 경로가 현재 외장 SSD 위치와 다릅니다.")
+        self.log(f"  등록됨: {entry.get('base_path') or '(없음)'}")
+        self.log(f"  현재:   {install_dir}")
+        if registered and not registered_ok:
+            self.log("  → 등록된 경로에 ext4.vhdx가 없습니다 (드라이브 문자/PC 변경 가능).")
+        self.log("  → VHDX는 유지한 채 BasePath만 현재 위치로 수정합니다.")
+
+        self._run(["wsl", "--shutdown"], timeout=90.0)
+        time.sleep(2)
+        result = set_wsl_registry_base_path(entry["guid_key"], install_dir)
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or "").strip()
+            self.log(f"  → BasePath 수정 실패: {message or '(출력 없음)'}")
+            self.log("  → 관리자 권한 없이 실패했다면, 동일 Windows 계정인지 확인하세요.")
+            return False
+
+        self.log("  → BasePath 수정 완료 (ext4.vhdx 보존)")
+        return True
 
     def probe_wsl_health(self) -> bool:
         """False when ext4 is stale (common after unplugging portable SSD while WSL was running)."""
@@ -716,43 +932,108 @@ class KaliLauncher:
                 "--",
                 "bash",
                 "-lc",
-                "test -r /usr/bin/kex && test -r /usr/lib/win-kex/xstartup && echo OK || echo BAD",
+                "test -x /usr/bin/kex && test -f /usr/lib/win-kex/xstartup && echo OK || echo BAD",
             ],
             timeout=45.0,
         )
         combined = f"{result.stdout}\n{result.stderr}"
         if self._wsl_output_unhealthy(combined):
+            detail = (result.stderr or result.stdout or "").strip()
+            self.log(f"  → 파일시스템/경로 오류: {detail[:500] or '(메시지 없음)'}")
             return False
-        return "OK" in (result.stdout or "")
+        if result.returncode == 124:
+            self.log("  → WSL 헬스체크 시간 초과 (탐색기/\\\\wsl$ 접근을 피하고 PC 재부팅을 권장)")
+            return False
+        if "OK" in (result.stdout or ""):
+            return True
+        detail = (result.stdout or result.stderr or "").strip()
+        self.log(f"  → KeX 헬스체크 실패 (exit {result.returncode}): {detail[:500] or '(출력 없음)'}")
+        return False
+
+    def _restart_lxss_manager(self) -> None:
+        """Best-effort service bounce after HCS timeouts (may need admin)."""
+        self.log("  → LxssManager 서비스 재시작 시도...")
+        for args in (
+            ["powershell", "-NoProfile", "-Command", "Restart-Service LxssManager -Force -ErrorAction SilentlyContinue"],
+            ["net", "stop", "LxssManager"],
+        ):
+            self._run(args, timeout=60.0)
+        time.sleep(2)
+        self._run(["net", "start", "LxssManager"], timeout=60.0)
+        time.sleep(3)
+
+    def _log_wsl_recovery_hints(self, detail: str) -> None:
+        self.log("이 PC에서만 실패할 때 흔한 원인:")
+        self.log("  1) 외장 SSD 드라이브 문자가 WSL 등록 경로와 다름 (BasePath)")
+        self.log("  2) BIOS/Windows 가상화(Virtual Machine Platform) 미활성")
+        self.log("  3) 이전 PC에서 「정지」 없이 SSD를 뽑아 VHDX가 불안정")
+        self.log("  4) 다른 창에서 같은 kali-linux 세션이 잠금 중")
+        lowered = (detail or "").lower()
+        if any(token in lowered for token in ("path", "경로", "cannot find", "찾을 수 없", "disk", "디스크")):
+            self.log("힌트: 등록 경로/드라이브 문자 문제 가능성이 큽니다. SSD가 F:로 보이는지 확인하세요.")
+        if any(token in lowered for token in ("virtual", "hypervisor", "0x80370102", "가상")):
+            self.log("힌트: Windows 기능에서 'Virtual Machine Platform'을 켠 뒤 재부팅하세요.")
+        if self._is_hcs_timeout(detail):
+            self.log("힌트: HCS_E_CONNECTION_TIMEOUT — WSL VM이 VHDX를 마운트하지 못했습니다.")
+            self.log("  · 런처/시작을 반복하지 마세요 (탐색기가 멈출 수 있음).")
+            self.log("  · \\\\wsl$ / \\\\wsl.localhost 폴더는 열지 마세요.")
+            self.log("  · wsl --shutdown 후 Windows를 한 번 재부팅하세요.")
+            self.log("  · 그래도 실패하면 ext4.vhdx 손상 가능 — kali-final.tar로 재등록을 검토하세요.")
+        status = self._run(["wsl", "-l", "-v"], timeout=30.0)
+        status_text = (status.stdout or status.stderr or "").strip()
+        if status_text:
+            self.log(f"WSL 상태:\n{status_text}")
 
     def recover_wsl(self) -> bool:
         """Reset WSL VM after portable drive reconnect or I/O errors."""
         self.log("WSL 복구 중... (외장 SSD 재연결 후 필요할 수 있습니다)")
-        self._run(["wsl", "--shutdown"], timeout=90.0)
-        time.sleep(6)
-        wake = self._run(
-            [
-                "wsl",
-                "--cd",
-                "~",
-                "-d",
-                self.config["distro_name"],
-                "-u",
-                self.config["wsl_user"],
-                "--",
-                "true",
-            ],
-            timeout=90.0,
-        )
-        if wake.returncode != 0 or self._wsl_output_unhealthy(f"{wake.stdout}\n{wake.stderr}"):
-            self.log(f"  → WSL 재시작 실패: {(wake.stderr or wake.stdout or '').strip()}")
+        if not self.sync_portable_base_path():
             return False
-        self.log("  → WSL 재시작 완료")
-        return True
+
+        last_detail = ""
+        for attempt in (1, 2, 3):
+            self.log(f"  → 복구 시도 {attempt}/3")
+            self._run(["wsl", "--shutdown"], timeout=90.0)
+            time.sleep(4 + attempt * 4)
+            if attempt >= 2:
+                self._restart_lxss_manager()
+
+            wake = self._run(
+                [
+                    "wsl",
+                    "--cd",
+                    "~",
+                    "-d",
+                    self.config["distro_name"],
+                    "-u",
+                    self.config["wsl_user"],
+                    "--",
+                    "true",
+                ],
+                timeout=90.0,
+            )
+            wake_text = f"{wake.stdout}\n{wake.stderr}"
+            if wake.returncode == 0 and not self._wsl_output_unhealthy(wake_text):
+                self.log("  → WSL 재시작 완료")
+                return True
+
+            last_detail = (wake.stderr or wake.stdout or "").strip()
+            self.log(f"  → 시도 {attempt} 실패: {last_detail or '(메시지 없음)'}")
+            if self._is_hcs_timeout(last_detail) or wake.returncode == 124:
+                # Extra hammering makes Explorer/Vmmem worse on external SSDs.
+                self.log("  → HCS 타임아웃 — 추가 재시도를 중단하고 안내만 표시합니다.")
+                break
+
+        self.log(f"  → WSL 재시작 실패: {last_detail or '(메시지 없음)'}")
+        self._log_wsl_recovery_hints(last_detail)
+        return False
 
     def ensure_wsl_healthy(self) -> bool:
         if not self.wsl_distro_exists():
             return True
+        if not self.sync_portable_base_path():
+            self.log("오류: 포터블 VHDX 경로(BasePath) 동기화에 실패했습니다.")
+            return False
         if self.probe_wsl_health():
             return True
         if not self.config.get("recover_wsl_on_start", True):
@@ -765,7 +1046,8 @@ class KaliLauncher:
             self.log("  → WSL 복구 성공")
             return True
         self.log("오류: WSL이 정상 상태로 복구되지 않았습니다.")
-        self.log("  SSD 연결 확인 후 PC 재부팅, 또는 WSL 내부 fsck가 필요할 수 있습니다.")
+        self.log("  시작 버튼을 반복하지 말고, SSD 연결 확인 후 PC를 재부팅하세요.")
+        self.log("  계속 HCS_E_CONNECTION_TIMEOUT이면 ext4.vhdx 점검 또는 tar 재등록이 필요할 수 있습니다.")
         return False
 
     def shutdown_wsl(self) -> None:
@@ -787,6 +1069,90 @@ class KaliLauncher:
 
         self.log("기존 KeX 세션 정리 중...")
         self._run(self._build_wsl_kex_cmd(["--stop"]), timeout=45.0)
+
+    def ensure_winkex_installed(self) -> bool:
+        """
+        Verify Win-KeX files inside the existing portable VHDX.
+        Never deletes/replaces ext4.vhdx. Never downloads a new Kali distro.
+        apt install is opt-in only (auto_install_winkex=true).
+        """
+        self.log("Win-KeX 구성 확인 (기존 VHDX 유지 · 새 Kali 다운로드 없음)")
+        check = (
+            "echo '--- paths ---'; "
+            "ls -la /usr/bin/kex /usr/lib/win-kex /usr/lib/win-kex/xstartup "
+            "/usr/lib/win-kex/TigerVNC/win-kex-win-x64 2>&1 | head -40; "
+            "echo '--- xstartup detail ---'; "
+            "file /usr/lib/win-kex/xstartup 2>&1 || true; "
+            "stat /usr/lib/win-kex/xstartup 2>&1 || true; "
+            "readlink -f /usr/lib/win-kex/xstartup 2>&1 || true; "
+            "missing=''; "
+            "test -x /usr/bin/kex || missing=\"$missing kex\"; "
+            "test -f /usr/lib/win-kex/xstartup || missing=\"$missing xstartup\"; "
+            "test -e /usr/lib/win-kex/TigerVNC/win-kex-win-x64 "
+            "|| missing=\"$missing win-kex-win-x64\"; "
+            "if command -v Xtigervnc >/dev/null 2>&1 || test -x /usr/bin/Xtigervnc; then "
+            "true; else missing=\"$missing Xtigervnc\"; fi; "
+            "if [ -z \"$missing\" ]; then echo WINKEX_OK; "
+            "else echo WINKEX_MISSING:$missing; fi"
+        )
+        result = self._run(
+            [
+                "wsl",
+                "--cd",
+                "~",
+                "-d",
+                self.config["distro_name"],
+                "-u",
+                self.config["wsl_user"],
+                "--",
+                "bash",
+                "-lc",
+                check,
+            ],
+            timeout=45.0,
+        )
+        out = (result.stdout or "").strip()
+        if out:
+            self.log(out[-1200:])
+        if "WINKEX_OK" in out:
+            self.log("  → Win-KeX 구성 정상 (VHDX 내용 유지)")
+            return True
+
+        self.log("  → Win-KeX 파일이 이 VHDX 안에서 확인되지 않습니다.")
+        self.log("  → 새 Kali를 받지 않습니다. ext4.vhdx도 삭제/교체하지 않습니다.")
+        if not self.config.get("auto_install_winkex", False):
+            self.log("힌트: 노트북과 같은 VHDX면 이 PC의 마운트/캐시 문제일 수 있습니다.")
+            self.log("  wsl --shutdown 후 다시 시작하세요.")
+            self.log("  패키지만 깨졌을 때만 VHDX 안에서: sudo apt install -y kali-win-kex")
+            self.log("  자동 apt를 쓰려면 config에 \"auto_install_winkex\": true")
+            return False
+
+        self.log("  → auto_install_winkex=true — 같은 VHDX 안에 패키지만 설치")
+        install = self._run(
+            [
+                "wsl",
+                "--cd",
+                "~",
+                "-d",
+                self.config["distro_name"],
+                "-u",
+                "root",
+                "--",
+                "bash",
+                "-lc",
+                "export DEBIAN_FRONTEND=noninteractive; "
+                "apt-get update -y && apt-get install -y kali-win-kex && echo INSTALL_OK || echo INSTALL_FAIL",
+            ],
+            timeout=900.0,
+        )
+        install_out = f"{install.stdout}\n{install.stderr}".strip()
+        if "INSTALL_OK" in install_out:
+            self.log("  → kali-win-kex 설치 완료 (VHDX 교체 없음)")
+            return True
+        self.log("오류: Win-KeX 복구 실패. VHDX는 그대로 두었습니다.")
+        if install_out:
+            self.log(f"설치 출력:\n{install_out[-800:]}")
+        return False
 
     def apply_xfce_fixes(self) -> None:
         """Keep Win-KeX on X11. WSLg Wayland env breaks Xfce 4.20 inside TigerVNC."""
@@ -832,11 +1198,15 @@ class KaliLauncher:
             self.log("  → 사용자 X11 설정 실패 (계속 진행)")
 
         # Patch system Win-KeX xstartup once so VNC session unsets Wayland.
+        # IMPORTANT: do not use $f / $short vars in wsl bash -lc strings — on some
+        # Windows hosts those get expanded to empty before bash sees them.
+        xstartup = "/usr/lib/win-kex/xstartup"
         patch = (
-            "f=/usr/lib/win-kex/xstartup; "
-            "if [ ! -f \"$f\" ]; then echo NO_XSTARTUP; exit 0; fi; "
-            "if grep -q 'unset WAYLAND_DISPLAY' \"$f\"; then echo ALREADY; exit 0; fi; "
-            "cp -a \"$f\" \"$f.bak-portable\"; "
+            f"echo \"probe: $(ls -la {xstartup} 2>&1)\"; "
+            f"if [ ! -e {xstartup} ]; then echo NO_XSTARTUP; exit 0; fi; "
+            f"if [ ! -f {xstartup} ]; then echo NOT_REGULAR_FILE; exit 0; fi; "
+            f"if grep -q 'unset WAYLAND_DISPLAY' {xstartup}; then echo ALREADY; exit 0; fi; "
+            f"cp -a {xstartup} {xstartup}.bak-portable; "
             "awk 'BEGIN{done=0} "
             "/^export GDK_BACKEND=x11/ && !done {"
             "  print; "
@@ -844,7 +1214,8 @@ class KaliLauncher:
             "  print \"unset WAYLAND_SOCKET\"; "
             "  print \"export QT_QPA_PLATFORM=xcb\"; "
             "  done=1; next"
-            "} {print}' \"$f\" > \"$f.new\" && mv \"$f.new\" \"$f\" && chmod 755 \"$f\" && echo PATCHED"
+            f"}} {{print}}' {xstartup} > {xstartup}.new "
+            f"&& mv {xstartup}.new {xstartup} && chmod 755 {xstartup} && echo PATCHED"
         )
         patch_result = self._run(
             [
@@ -864,6 +1235,8 @@ class KaliLauncher:
         )
         out = (patch_result.stdout or "").strip()
         self.log(f"  → Win-KeX xstartup: {out or patch_result.stderr or 'ok'}")
+        if "NO_XSTARTUP" in out or "NOT_REGULAR_FILE" in out:
+            self.log("  → xstartup 패치 건너뜀 (VHDX 삭제/재다운로드 없음). VNC 기동은 계속 시도합니다.")
 
     def _x11_unix_writable(self) -> bool:
         check = self._run(
@@ -887,13 +1260,23 @@ class KaliLauncher:
             return False
         return "WRITABLE" in (check.stdout or "")
 
-    def _fix_x11_unix_root(self) -> bool:
+    def _fix_x11_unix_root(self, *, force_recreate: bool = False) -> bool:
+        """
+        WSLg remounts /tmp/.X11-unix read-only; kex then asks for sudo and fails
+        non-interactively. Mount a writable tmpfs over it so kex does not need a password.
+        """
+        _ = force_recreate
         fix_script = (
+            "umount /tmp/.X11-unix 2>/dev/null || true; "
+            "rm -rf /tmp/.X11-unix; "
+            "mkdir -p /tmp/.X11-unix; "
+            "chmod 1777 /tmp/.X11-unix; "
+            "chown root:root /tmp/.X11-unix; "
+            "mount -t tmpfs -o mode=1777,size=16m winkex-x11 /tmp/.X11-unix "
+            "|| mount -t tmpfs -o mode=1777 tmpfs /tmp/.X11-unix || true; "
+            "chmod 1777 /tmp/.X11-unix; "
             "if touch /tmp/.X11-unix/.kex_w 2>/dev/null; then "
-            "rm -f /tmp/.X11-unix/.kex_w; echo OK; exit 0; fi; "
-            "mount -o remount,rw /tmp/.X11-unix 2>/dev/null || true; "
-            "if touch /tmp/.X11-unix/.kex_w 2>/dev/null; then "
-            "rm -f /tmp/.X11-unix/.kex_w; echo REMOUNT_OK; exit 0; fi; "
+            "rm -f /tmp/.X11-unix/.kex_w; echo TMPFS_OK; exit 0; fi; "
             "echo FAIL; exit 1"
         )
         fix = self._run(
@@ -913,11 +1296,78 @@ class KaliLauncher:
             timeout=45.0,
         )
         out = (fix.stdout or "").strip()
-        if fix.returncode == 0 and ("OK" in out or "REMOUNT_OK" in out):
-            self.log(f"  → X11 소켓 준비 완료 ({out or 'ok'})")
+        if fix.returncode == 0 and "TMPFS_OK" in out:
+            self.log(f"  → X11 소켓 tmpfs 준비 완료 ({out or 'ok'})")
             return True
-        self.log(f"  → X11 remount 실패: {out or fix.stderr}")
+        self.log(f"  → X11 소켓 수정 실패: {out or fix.stderr}")
         return False
+
+    def ensure_kex_nopasswd_mount(self) -> None:
+        """Allow kex's internal sudo mount/umount without an interactive password."""
+        user = self.config["wsl_user"]
+        # Avoid $vars in the wsl command string.
+        script = (
+            f"printf '%s\\n' "
+            f"'{user} ALL=(root) NOPASSWD: /bin/mount, /bin/umount, /usr/bin/mount, /usr/bin/umount' "
+            f"> /etc/sudoers.d/99-winkex-x11 && "
+            f"chmod 440 /etc/sudoers.d/99-winkex-x11 && "
+            f"visudo -cf /etc/sudoers.d/99-winkex-x11 >/dev/null 2>&1 && echo SUDOERS_OK || "
+            f"(rm -f /etc/sudoers.d/99-winkex-x11; echo SUDOERS_FAIL)"
+        )
+        result = self._run(
+            [
+                "wsl",
+                "--cd",
+                "~",
+                "-d",
+                self.config["distro_name"],
+                "-u",
+                "root",
+                "--",
+                "bash",
+                "-lc",
+                script,
+            ],
+            timeout=30.0,
+        )
+        out = (result.stdout or "").strip()
+        if "SUDOERS_OK" in out:
+            self.log("  → kex용 mount sudo NOPASSWD 설정 완료")
+        else:
+            self.log(f"  → sudoers 설정 건너뜀: {out or result.stderr or 'ok'}")
+
+    def clean_stale_vnc_state(self) -> None:
+        """Remove laptop-hostname pid files / locks that break vncserver on this PC."""
+        user = self.config["wsl_user"]
+        home = f"/home/{user}"
+        script = (
+            f"rm -f {home}/.config/tigervnc/*.pid "
+            f"{home}/.vnc/*.pid "
+            f"/tmp/.X1-lock /tmp/.X2-lock "
+            f"/tmp/.X11-unix/X1 /tmp/.X11-unix/X2 2>/dev/null || true; "
+            f"mkdir -p {home}/.config/tigervnc {home}/.cache/kali-launcher; "
+            f"echo CLEAN_OK"
+        )
+        result = self._run(
+            [
+                "wsl",
+                "--cd",
+                "~",
+                "-d",
+                self.config["distro_name"],
+                "-u",
+                "root",
+                "--",
+                "bash",
+                "-lc",
+                script,
+            ],
+            timeout=30.0,
+        )
+        if "CLEAN_OK" in (result.stdout or ""):
+            self.log("  → 이전 PC hostname VNC pid/lock 정리 완료")
+        else:
+            self.log(f"  → VNC 상태 정리 경고: {(result.stderr or result.stdout or '').strip()}")
 
     def prepare_x11_unix(self) -> bool:
         """
@@ -929,7 +1379,7 @@ class KaliLauncher:
             self.log("  → /tmp/.X11-unix 쓰기 가능")
             return True
 
-        self.log("  → 읽기 전용 — root로 remount (sudo 암호 입력 없음)")
+        self.log("  → 읽기 전용/WSLg 마운트 — root로 복구 (sudo 암호 입력 없음)")
         if self._fix_x11_unix_root():
             return True
 
@@ -938,6 +1388,55 @@ class KaliLauncher:
             if self.recover_wsl() and self._fix_x11_unix_root():
                 return True
 
+        return False
+
+    def wait_for_kex_desktop(self) -> bool:
+        """
+        Port 5901 can accept VNC before XFCE finishes starting.
+        Connecting early looks like 'connected but blank screen'.
+        """
+        wait_sec = float(self.config.get("kex_desktop_wait_sec", 40))
+        user = self.config["wsl_user"]
+        self.log(f"XFCE 데스크톱 준비 대기 중... (최대 {wait_sec:.0f}초)")
+        u = shlex.quote(user)
+        # Literal username only — Windows may expand $USER/$u to empty.
+        script = (
+            "for i in $(seq 1 "
+            + str(max(1, int(wait_sec)))
+            + "); do "
+            f"if pgrep -u {u} xfce4-session >/dev/null 2>&1 "
+            f"|| pgrep -u {u} xfwm4 >/dev/null 2>&1 "
+            f"|| pgrep -u {u} xfdesktop >/dev/null 2>&1 "
+            f"|| pgrep -u {u} xfce4-panel >/dev/null 2>&1; then "
+            "echo DESKTOP_OK; exit 0; fi; "
+            "sleep 1; "
+            "done; "
+            "pgrep -af 'xfce|Xtigervnc|xfwm' 2>/dev/null | head -20 || true; "
+            "echo DESKTOP_MISSING; exit 1"
+        )
+        result = self._run(
+            [
+                "wsl",
+                "--cd",
+                "~",
+                "-d",
+                self.config["distro_name"],
+                "-u",
+                self.config["wsl_user"],
+                "--",
+                "bash",
+                "-lc",
+                script,
+            ],
+            timeout=wait_sec + 15.0,
+        )
+        out = (result.stdout or "").strip()
+        if "DESKTOP_OK" in out:
+            self.log("  → XFCE 세션 감지됨")
+            return True
+        if out:
+            self.log(out[-500:])
+        self.log("  → XFCE 세션이 아직 없습니다 (VNC 서버는 유지한 채 클라이언트 연결)")
         return False
 
     def detect_and_start_xserver(self) -> None:
@@ -967,15 +1466,31 @@ class KaliLauncher:
         if vcxsrv:
             self._start_vcxsrv(vcxsrv)
 
-    def _build_wsl_kex_cmd(self, kex_args: list[str]) -> list[str]:
+    def _build_wsl_kex_cmd(self, kex_args: list[str], *, capture_log: bool = False) -> list[str]:
         # Strip WSLg Wayland vars so Xfce inside TigerVNC stays on X11.
+        # Avoid $HOME in the command string — some Windows hosts expand $vars early.
         quoted = " ".join(shlex.quote(a) for a in kex_args)
-        inner = (
-            "unset WAYLAND_DISPLAY WAYLAND_SOCKET; "
-            "export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11 QT_QPA_PLATFORM=xcb; "
-            "[ -f \"$HOME/.config/win-kex-env.sh\" ] && . \"$HOME/.config/win-kex-env.sh\"; "
-            f"exec kex {quoted}"
-        )
+        home = f"/home/{self.config['wsl_user']}"
+        env_file = f"{home}/.config/win-kex-env.sh"
+        log_file = f"{home}/.cache/kali-launcher/kex-start.log"
+        if capture_log:
+            inner = (
+                "unset WAYLAND_DISPLAY WAYLAND_SOCKET; "
+                "export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11 QT_QPA_PLATFORM=xcb; "
+                f"[ -f {shlex.quote(env_file)} ] && . {shlex.quote(env_file)}; "
+                f"mkdir -p {shlex.quote(home + '/.cache/kali-launcher')}; "
+                f": > {shlex.quote(log_file)}; "
+                f"exec >>{shlex.quote(log_file)} 2>&1; "
+                f"echo \"==== $(date -Iseconds) kex {quoted} ====\"; "
+                f"exec kex {quoted}"
+            )
+        else:
+            inner = (
+                "unset WAYLAND_DISPLAY WAYLAND_SOCKET; "
+                "export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11 QT_QPA_PLATFORM=xcb; "
+                f"[ -f {shlex.quote(env_file)} ] && . {shlex.quote(env_file)}; "
+                f"exec kex {quoted}"
+            )
         return [
             "wsl",
             "--cd",
@@ -990,31 +1505,253 @@ class KaliLauncher:
             inner,
         ]
 
+    def _wsl_ipv4(self) -> str | None:
+        result = self._run(
+            [
+                "wsl",
+                "-d",
+                self.config["distro_name"],
+                "-u",
+                self.config["wsl_user"],
+                "--",
+                "bash",
+                "-lc",
+                "hostname -I 2>/dev/null | tr ' ' '\\n' | awk -F. 'NF==4{print; exit}'",
+            ],
+            timeout=20.0,
+        )
+        ip = (result.stdout or "").strip().splitlines()
+        return ip[0].strip() if ip else None
+
+    def _peek_kex_start_log(self) -> str:
+        log_file = f"/home/{self.config['wsl_user']}/.cache/kali-launcher/kex-start.log"
+        result = self._run(
+            [
+                "wsl",
+                "--cd",
+                "~",
+                "-d",
+                self.config["distro_name"],
+                "-u",
+                self.config["wsl_user"],
+                "--",
+                "bash",
+                "-lc",
+                f"tail -n 40 {shlex.quote(log_file)} 2>/dev/null || true",
+            ],
+            timeout=20.0,
+        )
+        return (result.stdout or "").strip()
+
+    def _wait_for_vnc_port(self, port: int, wait_sec: float) -> bool:
+        """
+        Win-KeX/TigerVNC listens on 127.0.0.1 inside WSL. Windows must connect via
+        localhost forwarding — NOT the WSL eth0 IP (that yields WSAECONNREFUSED 10061).
+        """
+        wait_sec = max(float(wait_sec), 45.0)
+        # Always force client host back to localhost for Win-KeX.
+        self.config["vnc_host"] = "localhost"
+        host = "127.0.0.1"
+        wsl_ip = self._wsl_ipv4()
+        if wsl_ip:
+            self.log(f"  → WSL IP: {wsl_ip} (참고용 · 클라이언트는 localhost 사용)")
+
+        self.log(f"VNC 서버 대기 중... (localhost:{port}, 최대 {wait_sec:.0f}초)")
+        deadline = time.time() + wait_sec
+        last_peek = 0.0
+        while time.time() < deadline:
+            try:
+                with socket.create_connection((host, int(port)), timeout=1.0):
+                    self.log(f"  → VNC 응답: localhost:{port}")
+                    return True
+            except OSError:
+                pass
+            now = time.time()
+            if now - last_peek >= 6.0:
+                last_peek = now
+                # Also confirm from inside WSL whether Xtigervnc is actually listening.
+                listen = self._run(
+                    [
+                        "wsl",
+                        "-d",
+                        self.config["distro_name"],
+                        "-u",
+                        self.config["wsl_user"],
+                        "--",
+                        "bash",
+                        "-lc",
+                        f"ss -lntp 2>/dev/null | grep -E ':{port}\\b' || true",
+                    ],
+                    timeout=15.0,
+                )
+                listen_out = (listen.stdout or "").strip()
+                if listen_out:
+                    self.log(f"  → WSL 내부 리스닝 확인:\n{listen_out}")
+                    # Server is up inside WSL but Windows localhost not forwarded yet.
+                    if "127.0.0.1" in listen_out or "0.0.0.0" in listen_out or ":*" in listen_out:
+                        # Give localhost forwarding a moment; still require Windows connect.
+                        self.log("  → 서버는 떠 있음. localhost 포워딩 대기 중...")
+                peek = self._peek_kex_start_log()
+                if peek:
+                    lowered = peek.lower()
+                    if "win-kex server (win) is stopped" in lowered or "[sudo]" in lowered:
+                        self.log("  → kex가 서버를 띄우지 못했습니다 (sudo 암호/X11 읽기전용 가능):")
+                        self.log(peek[-700:])
+                        return False
+                    if any(
+                        token in lowered
+                        for token in ("error connecting", "can't parse pid", "failed", "denied")
+                    ):
+                        self.log("  → kex 로그에서 오류 감지:")
+                        self.log(peek[-600:])
+            time.sleep(0.4)
+        return False
+
+    def _diagnose_kex_server_failure(self) -> None:
+        self.log("VNC 서버 실패 진단 중... (VHDX 재다운로드 아님)")
+        script = (
+            "echo '--- kex --status ---'; "
+            "kex --status 2>&1 || true; "
+            "echo '--- listeners ---'; "
+            "ss -lntp 2>/dev/null | grep -E '590[0-9]|tiger|vnc' || "
+            "netstat -lntp 2>/dev/null | grep -E '590[0-9]' || true; "
+            "echo '--- processes ---'; "
+            "pgrep -af 'Xtigervnc|tigervnc|win-kex|kex' 2>/dev/null || true; "
+            "echo '--- xstartup ---'; "
+            "ls -la /usr/lib/win-kex/xstartup /usr/bin/kex 2>&1 || true; "
+            "echo '--- kex-start.log ---'; "
+            f"tail -n 80 /home/{self.config['wsl_user']}/.cache/kali-launcher/kex-start.log 2>/dev/null || "
+            "echo '(no log)'; "
+            "echo '--- ip ---'; "
+            "hostname -I 2>/dev/null || true"
+        )
+        result = self._run(
+            [
+                "wsl",
+                "--cd",
+                "~",
+                "-d",
+                self.config["distro_name"],
+                "-u",
+                self.config["wsl_user"],
+                "--",
+                "bash",
+                "-lc",
+                script,
+            ],
+            timeout=60.0,
+        )
+        detail = (result.stdout or result.stderr or "").strip()
+        if detail:
+            self.log(detail[-1800:])
+        wslconfig = os.path.join(os.environ.get("USERPROFILE", ""), ".wslconfig")
+        if os.path.isfile(wslconfig):
+            try:
+                text = open(wslconfig, encoding="utf-8", errors="ignore").read()
+            except OSError:
+                text = ""
+            if "localhostforwarding" in text.lower() and "false" in text.lower():
+                self.log("힌트: %USERPROFILE%\\.wslconfig 에 localhostForwarding=false 가 있습니다.")
+                self.log("  [wsl2] localhostForwarding=true 로 바꾼 뒤 wsl --shutdown 하세요.")
+        else:
+            self.log("힌트: localhost 포워딩 문제가 의심되면 %USERPROFILE%\\.wslconfig 에")
+            self.log("  [wsl2]")
+            self.log("  localhostForwarding=true")
+            self.log("  를 넣고 wsl --shutdown 후 다시 시도하세요.")
+
+
+    def _stage_winkex_files_local(self) -> tuple[str | None, str | None]:
+        """
+        Copy TigerVNC client + passwd to a local NTFS folder via `wsl cp` /mnt/c/...
+
+        Opening \\\\wsl$\\... from Explorer or CreateProcess while the portable VHDX
+        is slow/stuck makes Explorer appear to 'loop' and every wsl.exe call waits
+        for HCS timeouts. Local copies avoid that path entirely.
+        """
+        distro = self.config["distro_name"]
+        user = self.config["wsl_user"]
+        base = os.path.join(
+            os.environ.get("LOCALAPPDATA")
+            or os.environ.get("TEMP")
+            or os.environ.get("USERPROFILE")
+            or "C:\\",
+            "KaliLauncher",
+            "winkex-cache",
+        )
+        try:
+            os.makedirs(base, exist_ok=True)
+        except OSError as exc:
+            self.log(f"로컬 캐시 폴더 생성 실패: {exc}")
+            return None, None
+
+        client_win = os.path.join(base, "win-kex-win-x64.exe")
+        passwd_win = os.path.join(base, "passwd")
+        client_mnt = windows_path_to_wsl_mnt(client_win)
+        passwd_mnt = windows_path_to_wsl_mnt(passwd_win)
+        linux_client = "/usr/lib/win-kex/TigerVNC/win-kex-win-x64"
+        linux_passwd = f"/home/{user}/.config/tigervnc/passwd"
+
+        self.log("Win-KeX 클라이언트를 로컬 디스크로 복사 중 (\\\\wsl$ 미사용)...")
+        script = (
+            f"set -e; "
+            f"test -r {shlex.quote(linux_client)}; "
+            f"test -r {shlex.quote(linux_passwd)}; "
+            f"cp -f {shlex.quote(linux_client)} {shlex.quote(client_mnt)}; "
+            f"cp -f {shlex.quote(linux_passwd)} {shlex.quote(passwd_mnt)}; "
+            f"chmod 644 {shlex.quote(passwd_mnt)} 2>/dev/null || true; "
+            f"echo COPIED"
+        )
+        result = self._run(
+            [
+                "wsl",
+                "--cd",
+                "~",
+                "-d",
+                distro,
+                "-u",
+                "root",
+                "--",
+                "bash",
+                "-lc",
+                script,
+            ],
+            timeout=90.0,
+        )
+        if "COPIED" not in (result.stdout or "") or not (
+            os.path.isfile(client_win) and os.path.isfile(passwd_win)
+        ):
+            detail = (result.stderr or result.stdout or "").strip()
+            self.log(f"  → 로컬 복사 실패: {detail[:400] or '(메시지 없음)'}")
+            return None, None
+
+        self.log(f"  → {client_win}")
+        return client_win, passwd_win
+
     def _launch_winkex_client(self) -> bool:
         """
         Launch win-kex-win-x64 as a Windows process (not via wsl start-client).
 
-        `kex --win --start-client` starts the GUI through WSL interop, then exits.
-        When that short-lived wsl.exe session ends, the TigerVNC window often dies
-        immediately — which matches 'client not visible'. Direct Windows launch keeps it alive.
+        Prefer a local NTFS copy. Never require \\\\wsl$\\ — that path freezes Explorer
+        when the external-SSD VHDX / HCS stack is slow.
         """
         distro = self.config["distro_name"]
         user = self.config["wsl_user"]
 
-        # Wake distro so \\\\wsl$ paths resolve.
-        self._run(
-            ["wsl", "--cd", "~", "-d", distro, "-u", user, "--", "true"],
-            timeout=30.0,
-        )
-
-        client = wsl_unc_path(distro, "/usr/lib/win-kex/TigerVNC/win-kex-win-x64")
-        passwd = wsl_unc_path(distro, f"/home/{user}/.config/tigervnc/passwd")
-        if not client or not wait_for_path(client, 20):
-            self.log("오류: Win-KeX 클라이언트(win-kex-win-x64)를 찾을 수 없습니다.")
-            return False
-        if not passwd or not wait_for_path(passwd, 20):
-            self.log("오류: VNC 비밀번호 파일 없음. WSL에서 kex --passwd 로 설정하세요.")
-            return False
+        client, passwd = self._stage_winkex_files_local()
+        if not client or not passwd:
+            self.log("경고: 로컬 복사 실패 — \\\\wsl$ 폴백은 탐색기를 멈출 수 있어 짧게만 시도합니다.")
+            self._run(
+                ["wsl", "--cd", "~", "-d", distro, "-u", user, "--", "true"],
+                timeout=20.0,
+            )
+            client = wsl_unc_path(distro, "/usr/lib/win-kex/TigerVNC/win-kex-win-x64")
+            passwd = wsl_unc_path(distro, f"/home/{user}/.config/tigervnc/passwd")
+            if not client or not wait_for_path(client, 5):
+                self.log("오류: Win-KeX 클라이언트(win-kex-win-x64)를 찾을 수 없습니다.")
+                return False
+            if not passwd or not wait_for_path(passwd, 5):
+                self.log("오류: VNC 비밀번호 파일 없음. WSL에서 kex --passwd 로 설정하세요.")
+                return False
 
         for image_name in ("win-kex-win-x64.exe", "win-kex-win-x64"):
             if is_process_running(image_name):
@@ -1026,7 +1763,8 @@ class KaliLauncher:
                 time.sleep(0.5)
                 break
 
-        host = self.config.get("vnc_host", "localhost")
+        host = "localhost"
+        self.config["vnc_host"] = host
         display = self.config.get("kex_display", ":1")
         target = f"{host}{display}"
         fullscreen = "FullScreen=1" if self.config.get("winkex_fullscreen", False) else "FullScreen=0"
@@ -1107,14 +1845,19 @@ class KaliLauncher:
         if sound:
             server_args.append("-s")
 
-        # Avoid sudo password hang inside kex (read-only /tmp/.X11-unix).
-        self.prepare_x11_unix()
+        # Desktop WSLg remounts X11 RO and kex asks for sudo password.
+        self.log("X11 tmpfs + VNC 잔여 상태 준비 중...")
+        self.ensure_kex_nopasswd_mount()
+        self.clean_stale_vnc_state()
+        if not self._fix_x11_unix_root(force_recreate=True):
+            self.prepare_x11_unix()
 
         port = int(self.config.get("kex_vnc_port", 5901))
-        wait_sec = float(self.config.get("kex_server_wait_sec", 35))
+        # Local config may set 25s; portable/external SSD often needs longer.
+        wait_sec = max(float(self.config.get("kex_server_wait_sec", 60)), 45.0)
 
         for attempt in (1, 2):
-            cmd = self._build_wsl_kex_cmd(server_args)
+            cmd = self._build_wsl_kex_cmd(server_args, capture_log=True)
             self.log(f"Win-KeX 서버 시작... ({' '.join(server_args)}) [시도 {attempt}/2]")
             self.log(f"> {' '.join(cmd)}")
             # CRITICAL: kex --start often never exits. Never use subprocess.run here.
@@ -1125,19 +1868,33 @@ class KaliLauncher:
                 self.log(f"서버 시작 실패: {exc}")
                 return False
 
-            self.log(f"VNC 서버 대기 중... (localhost:{port}, 최대 {wait_sec:.0f}초)")
-            if wait_for_tcp_port("127.0.0.1", port, wait_sec):
-                self.log(f"  → VNC 서버 준비 완료 (포트 {port})")
-                return self._launch_winkex_client()
+            if not self._wait_for_vnc_port(port, wait_sec):
+                self.log(f"  → 포트 {port} 응답 없음")
+                self._diagnose_kex_server_failure()
+                if attempt == 1:
+                    self.log("  → Win-KeX/X11 재준비 후 한 번 더 시도합니다...")
+                    self._run(self._build_wsl_kex_cmd(["--kill"]), timeout=45.0)
+                    self.clean_stale_vnc_state()
+                    self.ensure_kex_nopasswd_mount()
+                    self._fix_x11_unix_root(force_recreate=True)
+                continue
 
-            self.log(f"  → 포트 {port} 응답 없음")
-            if attempt == 1:
-                self.log("  → X11 소켓 재준비 후 한 번 더 시도합니다...")
+            self.log(f"  → VNC 서버 준비 완료 (포트 {port})")
+            desktop_ok = self.wait_for_kex_desktop()
+            if not desktop_ok and attempt == 1:
+                self.log("  → 데스크톱 미기동 — 한 번만 KeX를 재시작합니다 (서버를 죽인 채 연결하지 않음)")
                 self._run(self._build_wsl_kex_cmd(["--kill"]), timeout=45.0)
-                self.prepare_x11_unix()
+                self.clean_stale_vnc_state()
+                self._fix_x11_unix_root(force_recreate=True)
+                continue
+
+            if not desktop_ok:
+                self.log("  → XFCE는 아직 없지만 VNC 서버는 살아 있습니다. 클라이언트를 연결합니다.")
+            # CRITICAL: never kex --kill here — that caused localhost:1 WSAECONNREFUSED 10061.
+            return self._launch_winkex_client()
 
         self.log("오류: VNC 서버가 시작되지 않아 클라이언트를 실행하지 않습니다.")
-        self.log("힌트: WSL에서 /tmp/.X11-unix 가 쓰기 가능해야 합니다.")
+        self.log("힌트: 새 Kali를 받는 문제가 아닙니다. 같은 VHDX + 이 PC의 X11(tmpfs)/sudo/VNC pid를 의심하세요.")
         return False
 
     def _start_kex_simple(self, kex_args: list[str]) -> bool:
@@ -1228,6 +1985,9 @@ class KaliLauncher:
             if vhdx:
                 self.log(f"VHDX: {vhdx} (보존)")
             self.log(f"배포판: {self.config['distro_name']} / 사용자: {self.config['wsl_user']}")
+            self.log("알림: ext4.vhdx 를 삭제/교체하거나 새 Kali를 받지 않습니다. 외장 SSD의 그 환경을 그대로 씁니다.")
+            self.log("알림: 시작 중 탐색기에서 \\\\wsl$ / Linux 아이콘 / ext4.vhdx 를 열지 마세요.")
+            self.log("알림: 외장 SSD의 VHDX는 첫 기동이 느릴 수 있습니다. 명령이 길면 HCS 대기일 수 있습니다.")
 
             if not self.ensure_wsl_platform():
                 return
@@ -1238,6 +1998,9 @@ class KaliLauncher:
                 self.prepare_wsl_session()
 
             if not self.import_wsl_if_needed():
+                return
+
+            if not self.ensure_winkex_installed():
                 return
 
             self.apply_xfce_fixes()

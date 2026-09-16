@@ -10,11 +10,13 @@ Thank you to everyone who helps improve this project.
 
 ## Contributing
 
-Contributions are welcome. To be listed here automatically:
+Contributions are welcome. To be listed here:
 
 1. Fork the repository and open a pull request.
 2. Use a Git commit email that is [verified on your GitHub account](https://docs.github.com/en/account-and-profile/setting-up-and-managing-your-personal-account-on-github/managing-email-preferences/setting-your-commit-email-address).
 3. Keep pull requests focused and include a short description of the change.
+
+Automated / cloud-agent assist commits are reviewed like any other PR. They are **not** added to the maintainer table above unless the project owner asks to list them.
 
 ## Recognition
 
