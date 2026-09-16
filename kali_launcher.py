@@ -29,7 +29,7 @@ from tkinter import messagebox, scrolledtext, ttk
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Kali Linux Portable"
-APP_VERSION = "1.2.11"
+APP_VERSION = "1.2.12"
 LXSS_REG_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss"
 DEFAULT_DISTRO = "kali-linux"
 DEFAULT_USER = "kali"
@@ -1198,13 +1198,15 @@ class KaliLauncher:
             self.log("  → 사용자 X11 설정 실패 (계속 진행)")
 
         # Patch system Win-KeX xstartup once so VNC session unsets Wayland.
+        # IMPORTANT: do not use $f / $short vars in wsl bash -lc strings — on some
+        # Windows hosts those get expanded to empty before bash sees them.
+        xstartup = "/usr/lib/win-kex/xstartup"
         patch = (
-            "f=/usr/lib/win-kex/xstartup; "
-            "echo \"probe: $(ls -la \"$f\" 2>&1)\"; "
-            "if [ ! -e \"$f\" ]; then echo NO_XSTARTUP; exit 0; fi; "
-            "if [ ! -f \"$f\" ]; then echo NOT_REGULAR_FILE; exit 0; fi; "
-            "if grep -q 'unset WAYLAND_DISPLAY' \"$f\"; then echo ALREADY; exit 0; fi; "
-            "cp -a \"$f\" \"$f.bak-portable\"; "
+            f"echo \"probe: $(ls -la {xstartup} 2>&1)\"; "
+            f"if [ ! -e {xstartup} ]; then echo NO_XSTARTUP; exit 0; fi; "
+            f"if [ ! -f {xstartup} ]; then echo NOT_REGULAR_FILE; exit 0; fi; "
+            f"if grep -q 'unset WAYLAND_DISPLAY' {xstartup}; then echo ALREADY; exit 0; fi; "
+            f"cp -a {xstartup} {xstartup}.bak-portable; "
             "awk 'BEGIN{done=0} "
             "/^export GDK_BACKEND=x11/ && !done {"
             "  print; "
@@ -1212,7 +1214,8 @@ class KaliLauncher:
             "  print \"unset WAYLAND_SOCKET\"; "
             "  print \"export QT_QPA_PLATFORM=xcb\"; "
             "  done=1; next"
-            "} {print}' \"$f\" > \"$f.new\" && mv \"$f.new\" \"$f\" && chmod 755 \"$f\" && echo PATCHED"
+            f"}} {{print}}' {xstartup} > {xstartup}.new "
+            f"&& mv {xstartup}.new {xstartup} && chmod 755 {xstartup} && echo PATCHED"
         )
         patch_result = self._run(
             [
@@ -1259,37 +1262,23 @@ class KaliLauncher:
 
     def _fix_x11_unix_root(self, *, force_recreate: bool = False) -> bool:
         """
-        WSLg often mounts /tmp/.X11-unix read-only (or as a symlink to /mnt/wslg).
-        Remount helps sometimes; recreating a real 1777 directory is the reliable fix
-        when VNC connects but the XFCE desktop stays blank/black.
+        WSLg remounts /tmp/.X11-unix read-only; kex then asks for sudo and fails
+        non-interactively. Mount a writable tmpfs over it so kex does not need a password.
         """
-        if force_recreate:
-            fix_script = (
-                "umount /tmp/.X11-unix 2>/dev/null || true; "
-                "rm -rf /tmp/.X11-unix; "
-                "mkdir -p /tmp/.X11-unix; "
-                "chmod 1777 /tmp/.X11-unix; "
-                "chown root:root /tmp/.X11-unix; "
-                "if touch /tmp/.X11-unix/.kex_w 2>/dev/null; then "
-                "rm -f /tmp/.X11-unix/.kex_w; echo RECREATE_OK; exit 0; fi; "
-                "echo FAIL; exit 1"
-            )
-        else:
-            fix_script = (
-                "if [ -e /tmp/.X11-unix ] && touch /tmp/.X11-unix/.kex_w 2>/dev/null; then "
-                "rm -f /tmp/.X11-unix/.kex_w; echo OK; exit 0; fi; "
-                "mount -o remount,rw /tmp/.X11-unix 2>/dev/null || true; "
-                "if touch /tmp/.X11-unix/.kex_w 2>/dev/null; then "
-                "rm -f /tmp/.X11-unix/.kex_w; echo REMOUNT_OK; exit 0; fi; "
-                "umount /tmp/.X11-unix 2>/dev/null || true; "
-                "rm -rf /tmp/.X11-unix; "
-                "mkdir -p /tmp/.X11-unix; "
-                "chmod 1777 /tmp/.X11-unix; "
-                "chown root:root /tmp/.X11-unix; "
-                "if touch /tmp/.X11-unix/.kex_w 2>/dev/null; then "
-                "rm -f /tmp/.X11-unix/.kex_w; echo RECREATE_OK; exit 0; fi; "
-                "echo FAIL; exit 1"
-            )
+        _ = force_recreate
+        fix_script = (
+            "umount /tmp/.X11-unix 2>/dev/null || true; "
+            "rm -rf /tmp/.X11-unix; "
+            "mkdir -p /tmp/.X11-unix; "
+            "chmod 1777 /tmp/.X11-unix; "
+            "chown root:root /tmp/.X11-unix; "
+            "mount -t tmpfs -o mode=1777,size=16m winkex-x11 /tmp/.X11-unix "
+            "|| mount -t tmpfs -o mode=1777 tmpfs /tmp/.X11-unix || true; "
+            "chmod 1777 /tmp/.X11-unix; "
+            "if touch /tmp/.X11-unix/.kex_w 2>/dev/null; then "
+            "rm -f /tmp/.X11-unix/.kex_w; echo TMPFS_OK; exit 0; fi; "
+            "echo FAIL; exit 1"
+        )
         fix = self._run(
             [
                 "wsl",
@@ -1307,11 +1296,78 @@ class KaliLauncher:
             timeout=45.0,
         )
         out = (fix.stdout or "").strip()
-        if fix.returncode == 0 and any(token in out for token in ("OK", "REMOUNT_OK", "RECREATE_OK")):
-            self.log(f"  → X11 소켓 준비 완료 ({out or 'ok'})")
+        if fix.returncode == 0 and "TMPFS_OK" in out:
+            self.log(f"  → X11 소켓 tmpfs 준비 완료 ({out or 'ok'})")
             return True
         self.log(f"  → X11 소켓 수정 실패: {out or fix.stderr}")
         return False
+
+    def ensure_kex_nopasswd_mount(self) -> None:
+        """Allow kex's internal sudo mount/umount without an interactive password."""
+        user = self.config["wsl_user"]
+        # Avoid $vars in the wsl command string.
+        script = (
+            f"printf '%s\\n' "
+            f"'{user} ALL=(root) NOPASSWD: /bin/mount, /bin/umount, /usr/bin/mount, /usr/bin/umount' "
+            f"> /etc/sudoers.d/99-winkex-x11 && "
+            f"chmod 440 /etc/sudoers.d/99-winkex-x11 && "
+            f"visudo -cf /etc/sudoers.d/99-winkex-x11 >/dev/null 2>&1 && echo SUDOERS_OK || "
+            f"(rm -f /etc/sudoers.d/99-winkex-x11; echo SUDOERS_FAIL)"
+        )
+        result = self._run(
+            [
+                "wsl",
+                "--cd",
+                "~",
+                "-d",
+                self.config["distro_name"],
+                "-u",
+                "root",
+                "--",
+                "bash",
+                "-lc",
+                script,
+            ],
+            timeout=30.0,
+        )
+        out = (result.stdout or "").strip()
+        if "SUDOERS_OK" in out:
+            self.log("  → kex용 mount sudo NOPASSWD 설정 완료")
+        else:
+            self.log(f"  → sudoers 설정 건너뜀: {out or result.stderr or 'ok'}")
+
+    def clean_stale_vnc_state(self) -> None:
+        """Remove laptop-hostname pid files / locks that break vncserver on this PC."""
+        user = self.config["wsl_user"]
+        home = f"/home/{user}"
+        script = (
+            f"rm -f {home}/.config/tigervnc/*.pid "
+            f"{home}/.vnc/*.pid "
+            f"/tmp/.X1-lock /tmp/.X2-lock "
+            f"/tmp/.X11-unix/X1 /tmp/.X11-unix/X2 2>/dev/null || true; "
+            f"mkdir -p {home}/.config/tigervnc {home}/.cache/kali-launcher; "
+            f"echo CLEAN_OK"
+        )
+        result = self._run(
+            [
+                "wsl",
+                "--cd",
+                "~",
+                "-d",
+                self.config["distro_name"],
+                "-u",
+                "root",
+                "--",
+                "bash",
+                "-lc",
+                script,
+            ],
+            timeout=30.0,
+        )
+        if "CLEAN_OK" in (result.stdout or ""):
+            self.log("  → 이전 PC hostname VNC pid/lock 정리 완료")
+        else:
+            self.log(f"  → VNC 상태 정리 경고: {(result.stderr or result.stdout or '').strip()}")
 
     def prepare_x11_unix(self) -> bool:
         """
@@ -1405,14 +1461,19 @@ class KaliLauncher:
 
     def _build_wsl_kex_cmd(self, kex_args: list[str], *, capture_log: bool = False) -> list[str]:
         # Strip WSLg Wayland vars so Xfce inside TigerVNC stays on X11.
+        # Avoid $HOME in the command string — some Windows hosts expand $vars early.
         quoted = " ".join(shlex.quote(a) for a in kex_args)
+        home = f"/home/{self.config['wsl_user']}"
+        env_file = f"{home}/.config/win-kex-env.sh"
+        log_file = f"{home}/.cache/kali-launcher/kex-start.log"
         if capture_log:
             inner = (
                 "unset WAYLAND_DISPLAY WAYLAND_SOCKET; "
                 "export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11 QT_QPA_PLATFORM=xcb; "
-                "[ -f \"$HOME/.config/win-kex-env.sh\" ] && . \"$HOME/.config/win-kex-env.sh\"; "
-                "mkdir -p \"$HOME/.cache/kali-launcher\"; "
-                "exec >>\"$HOME/.cache/kali-launcher/kex-start.log\" 2>&1; "
+                f"[ -f {shlex.quote(env_file)} ] && . {shlex.quote(env_file)}; "
+                f"mkdir -p {shlex.quote(home + '/.cache/kali-launcher')}; "
+                f": > {shlex.quote(log_file)}; "
+                f"exec >>{shlex.quote(log_file)} 2>&1; "
                 f"echo \"==== $(date -Iseconds) kex {quoted} ====\"; "
                 f"exec kex {quoted}"
             )
@@ -1420,7 +1481,7 @@ class KaliLauncher:
             inner = (
                 "unset WAYLAND_DISPLAY WAYLAND_SOCKET; "
                 "export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11 QT_QPA_PLATFORM=xcb; "
-                "[ -f \"$HOME/.config/win-kex-env.sh\" ] && . \"$HOME/.config/win-kex-env.sh\"; "
+                f"[ -f {shlex.quote(env_file)} ] && . {shlex.quote(env_file)}; "
                 f"exec kex {quoted}"
             )
         return [
@@ -1456,6 +1517,7 @@ class KaliLauncher:
         return ip[0].strip() if ip else None
 
     def _peek_kex_start_log(self) -> str:
+        log_file = f"/home/{self.config['wsl_user']}/.cache/kali-launcher/kex-start.log"
         result = self._run(
             [
                 "wsl",
@@ -1468,7 +1530,7 @@ class KaliLauncher:
                 "--",
                 "bash",
                 "-lc",
-                "tail -n 40 \"$HOME/.cache/kali-launcher/kex-start.log\" 2>/dev/null || true",
+                f"tail -n 40 {shlex.quote(log_file)} 2>/dev/null || true",
             ],
             timeout=20.0,
         )
@@ -1504,14 +1566,18 @@ class KaliLauncher:
                 except OSError:
                     pass
             now = time.time()
-            if now - last_peek >= 8.0:
+            if now - last_peek >= 6.0:
                 last_peek = now
                 peek = self._peek_kex_start_log()
                 if peek:
                     lowered = peek.lower()
+                    if "win-kex server (win) is stopped" in lowered or "[sudo]" in lowered:
+                        self.log("  → kex가 서버를 띄우지 못했습니다 (sudo 암호/X11 읽기전용 가능):")
+                        self.log(peek[-700:])
+                        return False
                     if any(
                         token in lowered
-                        for token in ("error", "failed", "cannot", "denied", "no such", "실패")
+                        for token in ("error connecting", "can't parse pid", "failed", "denied")
                     ):
                         self.log("  → kex 로그에서 오류 감지:")
                         self.log(peek[-600:])
@@ -1531,7 +1597,7 @@ class KaliLauncher:
             "echo '--- xstartup ---'; "
             "ls -la /usr/lib/win-kex/xstartup /usr/bin/kex 2>&1 || true; "
             "echo '--- kex-start.log ---'; "
-            "tail -n 80 \"$HOME/.cache/kali-launcher/kex-start.log\" 2>/dev/null || "
+            f"tail -n 80 /home/{self.config['wsl_user']}/.cache/kali-launcher/kex-start.log 2>/dev/null || "
             "echo '(no log)'; "
             "echo '--- ip ---'; "
             "hostname -I 2>/dev/null || true"
@@ -1755,9 +1821,10 @@ class KaliLauncher:
         if sound:
             server_args.append("-s")
 
-        # Desktop WSLg often leaves a "writable" mount that still breaks TigerVNC.
-        # Recreate a real 1777 directory before every WIN-mode start.
-        self.log("X11 소켓을 Win-KeX용으로 강제 재생성합니다...")
+        # Desktop WSLg remounts X11 RO and kex asks for sudo password.
+        self.log("X11 tmpfs + VNC 잔여 상태 준비 중...")
+        self.ensure_kex_nopasswd_mount()
+        self.clean_stale_vnc_state()
         if not self._fix_x11_unix_root(force_recreate=True):
             self.prepare_x11_unix()
 
@@ -1783,6 +1850,8 @@ class KaliLauncher:
                 if attempt == 1:
                     self.log("  → Win-KeX/X11 재준비 후 한 번 더 시도합니다...")
                     self._run(self._build_wsl_kex_cmd(["--kill"]), timeout=45.0)
+                    self.clean_stale_vnc_state()
+                    self.ensure_kex_nopasswd_mount()
                     self._fix_x11_unix_root(force_recreate=True)
                 continue
 
@@ -1801,8 +1870,9 @@ class KaliLauncher:
             return self._launch_winkex_client()
 
         self.log("오류: VNC 서버가 시작되지 않아 클라이언트를 실행하지 않습니다.")
-        self.log("힌트: 새 Kali를 받는 문제가 아닙니다. 같은 VHDX + 이 PC의 WSL 네트워크/X11을 의심하세요.")
+        self.log("힌트: 새 Kali를 받는 문제가 아닙니다. 같은 VHDX + 이 PC의 X11(tmpfs)/sudo/VNC pid를 의심하세요.")
         return False
+
     def _start_kex_simple(self, kex_args: list[str]) -> bool:
         cmd = self._build_wsl_kex_cmd(kex_args)
         self.log(f"Win-KeX 시작: {' '.join(kex_args)}")

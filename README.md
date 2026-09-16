@@ -1,6 +1,6 @@
 # Kali Linux Portable Launcher
 
-![Version](https://img.shields.io/badge/Version-1.2.11-blue) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Version](https://img.shields.io/badge/Version-1.2.12-blue) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A Windows GUI client for running **WSL Kali Linux** from a portable external SSD.  
 Start and stop Win-KeX (TigerVNC) sessions with one click.
@@ -104,7 +104,8 @@ Create `kali_launcher_config.json` next to the executable (this file is local an
 | VNC connects but screen is blank/black | XFCE did not start. v1.2.8+ recreates `/tmp/.X11-unix` and waits for the desktop. Manual fix: `kex --kill`, recreate `/tmp/.X11-unix` as a 1777 directory, then `kex --win -s`. |
 | Explorer loops / hangs when starting Kali | Usually `\\wsl$` or the VHDX on the external SSD is stuck. Do not open `\\wsl$`, Linux in the nav pane, or `ext4.vhdx` while starting. v1.2.9+ copies the Win-KeX client to `%LOCALAPPDATA%\\KaliLauncher` instead of launching from `\\wsl$`. Run `wsl --shutdown` and reboot if Explorer is already looping. |
 | `wsl` commands hang for a long time | The portable `ext4.vhdx` is on USB/SSD and/or HCS is timing out. After BasePath is correct, reboot once; avoid hammering Start. Prefer USB 3.x direct ports. |
-| VNC port 5901 never opens / `NO_XSTARTUP` | Win-KeX files are missing on this Kali (`/usr/lib/win-kex/xstartup`). v1.2.10+ tries `apt install kali-win-kex`. Manual: `sudo apt update && sudo apt install -y kali-win-kex` |
+| VNC port 5901 never opens / `NO_XSTARTUP` | Not a new Kali download. Same `ext4.vhdx` is kept. Check `ls -la /usr/lib/win-kex/xstartup`. v1.2.11+ also tries the WSL eth0 IP if localhost forwarding fails on this PC. Optional in-place package repair only if `"auto_install_winkex": true`. |
+| `kex` asks for sudo / read-only `/tmp/.X11-unix` / bad pid file | Desktop WSLg remounts X11 RO and leftover `Z-sys.localdomain:1.pid` from the laptop breaks TigerVNC. v1.2.12 mounts a writable tmpfs, adds mount NOPASSWD, and clears stale pid/lock files. |
 | `/tmp/.X11-unix` read-only / VNC never starts | Fixed automatically in v1.2.5 via root remount after WSL health check |
 
 ## Tech stack
