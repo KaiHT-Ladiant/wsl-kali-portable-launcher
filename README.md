@@ -44,9 +44,12 @@ The launcher resolves paths from its own location. Running from `dist\` or the p
 
 ### Option 1: Release executable (recommended)
 
-1. Download `KaliLauncher.exe` from [Releases](../../releases)
-2. Place it in your `kali-portable` folder
+1. Download `KaliLauncher.exe` from [Releases](../../releases) **or** from the latest **Actions → Build EXE** artifact on this branch
+2. Place it in your `kali-portable` / `0.Kali` folder (replace the old exe)
 3. Run it and click **Start Kali Linux**
+
+> Cloud/PR fixes land in GitHub first. The copy on your external SSD (`F:\0.Kali\...`) does **not** update until you replace that `.exe` (or rebuild with `build_exe.bat`).
+
 
 ### Option 2: Build from source
 
