@@ -1,6 +1,6 @@
 # Kali Linux Portable Launcher
 
-![Version](https://img.shields.io/badge/Version-1.2.5-blue) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Version](https://img.shields.io/badge/Version-1.2.7-blue) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A Windows GUI client for running **WSL Kali Linux** from a portable external SSD.  
 Start and stop Win-KeX (TigerVNC) sessions with one click.
@@ -95,6 +95,9 @@ Create `kali_launcher_config.json` next to the executable (this file is local an
 | WSL import fails | Run the launcher as administrator |
 | Connection refused on VNC port | Confirm `kex_vnc_port` is `5901` |
 | Fails after unplugging external SSD | Use **Stop Kali Linux** first (v1.2.5+ shuts down WSL). If it still fails, restart the launcher — it auto-recovers. |
+| Works on another PC, fails on this PC | Usually the SSD drive letter changed and WSL `BasePath` still points at the old path. v1.2.6+ rewrites `BasePath` to the current `ext4.vhdx` folder (never deletes the VHDX). Also confirm Virtual Machine Platform is enabled. |
+| Log shows `WSL 재시작 실패` with garbled text | Fixed in v1.2.6 (UTF-16/Korean console decoding). Re-run with the new build to see the real Windows error. |
+| `HCS_E_CONNECTION_TIMEOUT` / Explorer freezes | Do **not** spam Start. Run `wsl --shutdown`, avoid opening `\\wsl$`, reboot Windows, then try once. If it still times out, the VHDX may be unhealthy — keep a copy of `ext4.vhdx` and consider re-import from `kali-final.tar`. |
 | `/tmp/.X11-unix` read-only / VNC never starts | Fixed automatically in v1.2.5 via root remount after WSL health check |
 
 ## Tech stack

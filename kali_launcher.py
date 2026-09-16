@@ -11,6 +11,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -28,7 +29,8 @@ from tkinter import messagebox, scrolledtext, ttk
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Kali Linux Portable"
-APP_VERSION = "1.2.5"
+APP_VERSION = "1.2.7"
+LXSS_REG_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss"
 DEFAULT_DISTRO = "kali-linux"
 DEFAULT_USER = "kali"
 CONFIG_FILENAME = "kali_launcher_config.json"
@@ -411,28 +413,139 @@ class RunResult:
 
 
 def decode_subprocess_output(data: bytes | str | None) -> str:
-    """WSL 명령 출력은 Windows에서 UTF-16 LE인 경우가 많음."""
+    """
+    WSL/콘솔 출력 디코딩.
+    wsl.exe는 UTF-16 LE를 쓰는 경우가 많고, 한글 Windows 메시지는
+    두 번째 바이트가 0이 아니라 기존 ASCII 휴리스틱만으로는 깨진다.
+    """
     if not data:
         return ""
     if isinstance(data, str):
         return data.replace("\x00", "").strip()
 
     if data.startswith(b"\xff\xfe"):
-        return data.decode("utf-16").strip()
+        return data.decode("utf-16").replace("\x00", "").strip()
     if data.startswith(b"\xfe\xff"):
-        return data.decode("utf-16-be").strip()
-    if len(data) >= 2 and data[1:2] == b"\x00":
-        try:
-            return data.decode("utf-16-le").replace("\x00", "").strip()
-        except UnicodeDecodeError:
-            pass
+        return data.decode("utf-16-be").replace("\x00", "").strip()
 
-    for encoding in ("utf-8", "cp949"):
+    candidates: list[str] = []
+    encodings: list[str] = []
+    null_ratio = data.count(0) / max(1, len(data))
+    if len(data) % 2 == 0 and null_ratio >= 0.05:
+        encodings.append("utf-16-le")
+    encodings.extend(["utf-8", "cp949"])
+    if "utf-16-le" not in encodings and len(data) % 2 == 0:
+        encodings.append("utf-16-le")
+
+    for encoding in encodings:
         try:
-            return data.decode(encoding).strip()
+            text = data.decode(encoding)
         except UnicodeDecodeError:
+            text = data.decode(encoding, errors="replace")
+        candidates.append(text.replace("\x00", "").strip())
+
+    if not candidates:
+        return data.decode("utf-8", errors="replace").replace("\x00", "").strip()
+
+    def _score(text: str) -> tuple[int, int]:
+        replacement = text.count("\ufffd")
+        controls = sum(1 for ch in text if ord(ch) < 32 and ch not in "\r\n\t")
+        hangul = sum(1 for ch in text if "\uac00" <= ch <= "\ud7a3")
+        printable = sum(1 for ch in text if ch.isprintable() or ch in "\r\n\t")
+        return (-(replacement + controls), hangul + printable)
+
+    return max(candidates, key=_score)
+
+
+def normalize_wsl_base_path(path: str | None) -> str:
+    """Compare BasePath values across \\\\?\\ prefixes and drive-letter case."""
+    value = (path or "").strip().strip('"')
+    if value.startswith("\\\\?\\"):
+        value = value[4:]
+    if not value:
+        return ""
+    return os.path.normcase(os.path.normpath(value))
+
+
+def format_wsl_base_path(path: str) -> str:
+    normalized = os.path.normpath(path)
+    if normalized.startswith("\\\\?\\"):
+        return normalized
+    return "\\\\?\\" + normalized
+
+
+def parse_lxss_registry_output(text: str) -> list[dict]:
+    """Parse `reg query HKCU\\...\\Lxss /s` into distro entries."""
+    entries: list[dict] = []
+    current: dict | None = None
+
+    def _flush() -> None:
+        nonlocal current
+        if current and current.get("guid") and current.get("name"):
+            entries.append(current)
+        current = None
+
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
             continue
-    return data.decode("utf-8", errors="replace").strip()
+        if line.startswith("HKEY_") or line.startswith("HKCU"):
+            _flush()
+            tail = line.rstrip("\\").split("\\")[-1]
+            current = {
+                "guid_key": line,
+                "guid": tail if tail.startswith("{") and tail.endswith("}") else None,
+                "name": None,
+                "base_path": None,
+            }
+            continue
+        if current is None:
+            continue
+        match = re.match(r"^(\S+)\s+REG_\w+\s+(.*)$", line)
+        if not match:
+            continue
+        key = match.group(1)
+        value = match.group(2)
+        key_l = key.lower()
+        if key_l == "distributionname":
+            current["name"] = value
+        elif key_l == "basepath":
+            current["base_path"] = value
+    _flush()
+    return entries
+
+
+def list_wsl_registry_distros() -> list[dict]:
+    result = run_command(["reg", "query", LXSS_REG_KEY, "/s"], timeout=30)
+    if result.returncode != 0 and not (result.stdout or "").strip():
+        return []
+    return parse_lxss_registry_output(result.stdout or "")
+
+
+def get_wsl_registry_entry(distro_name: str) -> dict | None:
+    target = (distro_name or "").lower()
+    for entry in list_wsl_registry_distros():
+        if (entry.get("name") or "").lower() == target:
+            return entry
+    return None
+
+
+def set_wsl_registry_base_path(guid_key: str, install_dir: str) -> RunResult:
+    return run_command(
+        [
+            "reg",
+            "add",
+            guid_key,
+            "/v",
+            "BasePath",
+            "/t",
+            "REG_SZ",
+            "/d",
+            format_wsl_base_path(install_dir),
+            "/f",
+        ],
+        timeout=30,
+    )
 
 
 def safe_windows_cwd() -> str:
@@ -699,8 +812,85 @@ class KaliLauncher:
             "read-only file system",
             "cannot remove",
             "device or resource busy",
+            "cannot find the path",
+            "cannot find the file",
+            "the system cannot find",
+            "access is denied",
+            "device not ready",
+            "not a valid",
+            "거부되었습니다",
+            "경로를 찾을 수 없",
+            "파일을 찾을 수 없",
+            "디스크가 없습니다",
+            "장치를 찾을 수 없",
+            "error code",
+            "오류 코드",
+            "hcs_",
+            "wsl_e_",
+            "0x800",
+            "connection_timeout",
+            "시간이 초과",
+            "응답을 받지 못",
+            "operation timed out",
+            "timed out",
         )
         return any(marker in lowered for marker in markers)
+
+    def _is_hcs_timeout(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        return any(
+            token in lowered
+            for token in (
+                "hcs_e_connection_timeout",
+                "connection_timeout",
+                "응답을 받지 못",
+                "시간이 초과",
+                "operation timed out",
+            )
+        )
+
+    def sync_portable_base_path(self) -> bool:
+        """
+        외장 SSD를 다른 PC에 꽂거나 드라이브 문자가 바뀌면
+        HKCU Lxss BasePath가 옛 경로를 가리켜 배포판이 뜨지 않는다.
+        VHDX는 삭제/unregister 하지 않고 BasePath만 현재 폴더로 맞춘다.
+        """
+        install_dir = self.paths["wsl_install_dir"]
+        vhdx_path = find_vhdx(install_dir)
+        if not vhdx_path or not self.wsl_distro_exists():
+            return True
+
+        entry = get_wsl_registry_entry(self.config["distro_name"])
+        if not entry or not entry.get("guid_key"):
+            self.log("경고: WSL 목록에는 있으나 레지스트리 BasePath를 찾지 못했습니다.")
+            return True
+
+        registered = normalize_wsl_base_path(entry.get("base_path"))
+        expected = normalize_wsl_base_path(install_dir)
+        registered_vhdx = os.path.join(registered, VHDX_FILENAME) if registered else ""
+        registered_ok = bool(registered) and os.path.isfile(registered_vhdx)
+
+        if registered == expected and registered_ok:
+            return True
+
+        self.log("WSL 등록 경로가 현재 외장 SSD 위치와 다릅니다.")
+        self.log(f"  등록됨: {entry.get('base_path') or '(없음)'}")
+        self.log(f"  현재:   {install_dir}")
+        if registered and not registered_ok:
+            self.log("  → 등록된 경로에 ext4.vhdx가 없습니다 (드라이브 문자/PC 변경 가능).")
+        self.log("  → VHDX는 유지한 채 BasePath만 현재 위치로 수정합니다.")
+
+        self._run(["wsl", "--shutdown"], timeout=90.0)
+        time.sleep(2)
+        result = set_wsl_registry_base_path(entry["guid_key"], install_dir)
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or "").strip()
+            self.log(f"  → BasePath 수정 실패: {message or '(출력 없음)'}")
+            self.log("  → 관리자 권한 없이 실패했다면, 동일 Windows 계정인지 확인하세요.")
+            return False
+
+        self.log("  → BasePath 수정 완료 (ext4.vhdx 보존)")
+        return True
 
     def probe_wsl_health(self) -> bool:
         """False when ext4 is stale (common after unplugging portable SSD while WSL was running)."""
@@ -722,37 +912,102 @@ class KaliLauncher:
         )
         combined = f"{result.stdout}\n{result.stderr}"
         if self._wsl_output_unhealthy(combined):
+            detail = (result.stderr or result.stdout or "").strip()
+            self.log(f"  → 파일시스템/경로 오류: {detail[:500] or '(메시지 없음)'}")
             return False
-        return "OK" in (result.stdout or "")
+        if result.returncode == 124:
+            self.log("  → WSL 헬스체크 시간 초과 (탐색기/\\\\wsl$ 접근을 피하고 PC 재부팅을 권장)")
+            return False
+        if "OK" in (result.stdout or ""):
+            return True
+        detail = (result.stdout or result.stderr or "").strip()
+        self.log(f"  → KeX 헬스체크 실패 (exit {result.returncode}): {detail[:500] or '(출력 없음)'}")
+        return False
+
+    def _restart_lxss_manager(self) -> None:
+        """Best-effort service bounce after HCS timeouts (may need admin)."""
+        self.log("  → LxssManager 서비스 재시작 시도...")
+        for args in (
+            ["powershell", "-NoProfile", "-Command", "Restart-Service LxssManager -Force -ErrorAction SilentlyContinue"],
+            ["net", "stop", "LxssManager"],
+        ):
+            self._run(args, timeout=60.0)
+        time.sleep(2)
+        self._run(["net", "start", "LxssManager"], timeout=60.0)
+        time.sleep(3)
+
+    def _log_wsl_recovery_hints(self, detail: str) -> None:
+        self.log("이 PC에서만 실패할 때 흔한 원인:")
+        self.log("  1) 외장 SSD 드라이브 문자가 WSL 등록 경로와 다름 (BasePath)")
+        self.log("  2) BIOS/Windows 가상화(Virtual Machine Platform) 미활성")
+        self.log("  3) 이전 PC에서 「정지」 없이 SSD를 뽑아 VHDX가 불안정")
+        self.log("  4) 다른 창에서 같은 kali-linux 세션이 잠금 중")
+        lowered = (detail or "").lower()
+        if any(token in lowered for token in ("path", "경로", "cannot find", "찾을 수 없", "disk", "디스크")):
+            self.log("힌트: 등록 경로/드라이브 문자 문제 가능성이 큽니다. SSD가 F:로 보이는지 확인하세요.")
+        if any(token in lowered for token in ("virtual", "hypervisor", "0x80370102", "가상")):
+            self.log("힌트: Windows 기능에서 'Virtual Machine Platform'을 켠 뒤 재부팅하세요.")
+        if self._is_hcs_timeout(detail):
+            self.log("힌트: HCS_E_CONNECTION_TIMEOUT — WSL VM이 VHDX를 마운트하지 못했습니다.")
+            self.log("  · 런처/시작을 반복하지 마세요 (탐색기가 멈출 수 있음).")
+            self.log("  · \\\\wsl$ / \\\\wsl.localhost 폴더는 열지 마세요.")
+            self.log("  · wsl --shutdown 후 Windows를 한 번 재부팅하세요.")
+            self.log("  · 그래도 실패하면 ext4.vhdx 손상 가능 — kali-final.tar로 재등록을 검토하세요.")
+        status = self._run(["wsl", "-l", "-v"], timeout=30.0)
+        status_text = (status.stdout or status.stderr or "").strip()
+        if status_text:
+            self.log(f"WSL 상태:\n{status_text}")
 
     def recover_wsl(self) -> bool:
         """Reset WSL VM after portable drive reconnect or I/O errors."""
         self.log("WSL 복구 중... (외장 SSD 재연결 후 필요할 수 있습니다)")
-        self._run(["wsl", "--shutdown"], timeout=90.0)
-        time.sleep(6)
-        wake = self._run(
-            [
-                "wsl",
-                "--cd",
-                "~",
-                "-d",
-                self.config["distro_name"],
-                "-u",
-                self.config["wsl_user"],
-                "--",
-                "true",
-            ],
-            timeout=90.0,
-        )
-        if wake.returncode != 0 or self._wsl_output_unhealthy(f"{wake.stdout}\n{wake.stderr}"):
-            self.log(f"  → WSL 재시작 실패: {(wake.stderr or wake.stdout or '').strip()}")
+        if not self.sync_portable_base_path():
             return False
-        self.log("  → WSL 재시작 완료")
-        return True
+
+        last_detail = ""
+        for attempt in (1, 2, 3):
+            self.log(f"  → 복구 시도 {attempt}/3")
+            self._run(["wsl", "--shutdown"], timeout=90.0)
+            time.sleep(4 + attempt * 4)
+            if attempt >= 2:
+                self._restart_lxss_manager()
+
+            wake = self._run(
+                [
+                    "wsl",
+                    "--cd",
+                    "~",
+                    "-d",
+                    self.config["distro_name"],
+                    "-u",
+                    self.config["wsl_user"],
+                    "--",
+                    "true",
+                ],
+                timeout=90.0,
+            )
+            wake_text = f"{wake.stdout}\n{wake.stderr}"
+            if wake.returncode == 0 and not self._wsl_output_unhealthy(wake_text):
+                self.log("  → WSL 재시작 완료")
+                return True
+
+            last_detail = (wake.stderr or wake.stdout or "").strip()
+            self.log(f"  → 시도 {attempt} 실패: {last_detail or '(메시지 없음)'}")
+            if self._is_hcs_timeout(last_detail) or wake.returncode == 124:
+                # Extra hammering makes Explorer/Vmmem worse on external SSDs.
+                self.log("  → HCS 타임아웃 — 추가 재시도를 중단하고 안내만 표시합니다.")
+                break
+
+        self.log(f"  → WSL 재시작 실패: {last_detail or '(메시지 없음)'}")
+        self._log_wsl_recovery_hints(last_detail)
+        return False
 
     def ensure_wsl_healthy(self) -> bool:
         if not self.wsl_distro_exists():
             return True
+        if not self.sync_portable_base_path():
+            self.log("오류: 포터블 VHDX 경로(BasePath) 동기화에 실패했습니다.")
+            return False
         if self.probe_wsl_health():
             return True
         if not self.config.get("recover_wsl_on_start", True):
@@ -765,7 +1020,8 @@ class KaliLauncher:
             self.log("  → WSL 복구 성공")
             return True
         self.log("오류: WSL이 정상 상태로 복구되지 않았습니다.")
-        self.log("  SSD 연결 확인 후 PC 재부팅, 또는 WSL 내부 fsck가 필요할 수 있습니다.")
+        self.log("  시작 버튼을 반복하지 말고, SSD 연결 확인 후 PC를 재부팅하세요.")
+        self.log("  계속 HCS_E_CONNECTION_TIMEOUT이면 ext4.vhdx 점검 또는 tar 재등록이 필요할 수 있습니다.")
         return False
 
     def shutdown_wsl(self) -> None:
