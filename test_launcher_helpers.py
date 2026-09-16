@@ -47,8 +47,14 @@ class PathTests(unittest.TestCase):
         from kali_launcher import windows_path_to_wsl_mnt
 
         converted = windows_path_to_wsl_mnt(r"C:\Users\kaiht\AppData\Local\KaliLauncher\winkex-cache\passwd")
-        self.assertTrue(converted.startswith("/mnt/c/"))
-        self.assertIn("KaliLauncher/winkex-cache/passwd", converted.replace("\\", "/"))
+        self.assertEqual(
+            converted,
+            "/mnt/c/Users/kaiht/AppData/Local/KaliLauncher/winkex-cache/passwd",
+        )
+        self.assertEqual(
+            windows_path_to_wsl_mnt(r"\\?\D:\cache\win-kex-win-x64.exe"),
+            "/mnt/d/cache/win-kex-win-x64.exe",
+        )
 
 
 class RegistryParseTests(unittest.TestCase):

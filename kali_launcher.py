@@ -280,9 +280,22 @@ def wait_for_path(path: str, timeout: float = 20.0) -> bool:
 
 def windows_path_to_wsl_mnt(path: str) -> str:
     """C:\\Users\\a\\b -> /mnt/c/Users/a/b (for wsl cp, avoids \\\\wsl$)."""
-    abs_path = os.path.abspath(path)
+    raw = (path or "").strip().strip('"')
+    normalized = raw.replace("/", "\\")
+    match = re.match(r"^\\\\[?]\\([A-Za-z]):\\(.*)$", normalized)
+    if match:
+        letter = match.group(1).lower()
+        tail = match.group(2).replace("\\", "/")
+        return f"/mnt/{letter}/{tail}"
+    match = re.match(r"^([A-Za-z]):\\(.*)$", normalized)
+    if match:
+        letter = match.group(1).lower()
+        tail = match.group(2).replace("\\", "/")
+        return f"/mnt/{letter}/{tail}"
+    # Last resort for unusual paths (should not happen on Windows launcher runs).
+    abs_path = os.path.abspath(raw)
     drive, tail = os.path.splitdrive(abs_path)
-    letter = drive.rstrip(":\\/").lower()
+    letter = drive.rstrip(":\\/").lower() or "c"
     unix_tail = tail.replace("\\", "/")
     if not unix_tail.startswith("/"):
         unix_tail = "/" + unix_tail
