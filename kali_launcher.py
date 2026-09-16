@@ -29,7 +29,7 @@ from tkinter import messagebox, scrolledtext, ttk
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Kali Linux Portable"
-APP_VERSION = "1.2.12"
+APP_VERSION = "1.2.13"
 LXSS_REG_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss"
 DEFAULT_DISTRO = "kali-linux"
 DEFAULT_USER = "kali"
@@ -1538,36 +1538,52 @@ class KaliLauncher:
 
     def _wait_for_vnc_port(self, port: int, wait_sec: float) -> bool:
         """
-        Prefer localhost; if this PC's WSL localhost forwarding is broken,
-        fall back to the distro eth0 IP (common laptop-vs-desktop difference).
+        Win-KeX/TigerVNC listens on 127.0.0.1 inside WSL. Windows must connect via
+        localhost forwarding — NOT the WSL eth0 IP (that yields WSAECONNREFUSED 10061).
         """
         wait_sec = max(float(wait_sec), 45.0)
-        hosts = ["127.0.0.1"]
+        # Always force client host back to localhost for Win-KeX.
+        self.config["vnc_host"] = "localhost"
+        host = "127.0.0.1"
         wsl_ip = self._wsl_ipv4()
         if wsl_ip:
-            hosts.append(wsl_ip)
-            self.log(f"  → WSL IP: {wsl_ip}")
+            self.log(f"  → WSL IP: {wsl_ip} (참고용 · 클라이언트는 localhost 사용)")
 
-        self.log(f"VNC 서버 대기 중... ({'/'.join(hosts)}:{port}, 최대 {wait_sec:.0f}초)")
+        self.log(f"VNC 서버 대기 중... (localhost:{port}, 최대 {wait_sec:.0f}초)")
         deadline = time.time() + wait_sec
         last_peek = 0.0
         while time.time() < deadline:
-            for host in hosts:
-                try:
-                    with socket.create_connection((host, int(port)), timeout=1.0):
-                        self.log(f"  → VNC 응답: {host}:{port}")
-                        if host != "127.0.0.1":
-                            self.config["vnc_host"] = host
-                            self.log(
-                                "  → 이 PC는 localhost 포워딩이 약합니다. "
-                                "클라이언트를 WSL IP로 연결합니다."
-                            )
-                        return True
-                except OSError:
-                    pass
+            try:
+                with socket.create_connection((host, int(port)), timeout=1.0):
+                    self.log(f"  → VNC 응답: localhost:{port}")
+                    return True
+            except OSError:
+                pass
             now = time.time()
             if now - last_peek >= 6.0:
                 last_peek = now
+                # Also confirm from inside WSL whether Xtigervnc is actually listening.
+                listen = self._run(
+                    [
+                        "wsl",
+                        "-d",
+                        self.config["distro_name"],
+                        "-u",
+                        self.config["wsl_user"],
+                        "--",
+                        "bash",
+                        "-lc",
+                        f"ss -lntp 2>/dev/null | grep -E ':{port}\\b' || true",
+                    ],
+                    timeout=15.0,
+                )
+                listen_out = (listen.stdout or "").strip()
+                if listen_out:
+                    self.log(f"  → WSL 내부 리스닝 확인:\n{listen_out}")
+                    # Server is up inside WSL but Windows localhost not forwarded yet.
+                    if "127.0.0.1" in listen_out or "0.0.0.0" in listen_out or ":*" in listen_out:
+                        # Give localhost forwarding a moment; still require Windows connect.
+                        self.log("  → 서버는 떠 있음. localhost 포워딩 대기 중...")
                 peek = self._peek_kex_start_log()
                 if peek:
                     lowered = peek.lower()
@@ -1740,7 +1756,8 @@ class KaliLauncher:
                 time.sleep(0.5)
                 break
 
-        host = self.config.get("vnc_host", "localhost")
+        host = "localhost"
+        self.config["vnc_host"] = host
         display = self.config.get("kex_display", ":1")
         target = f"{host}{display}"
         fullscreen = "FullScreen=1" if self.config.get("winkex_fullscreen", False) else "FullScreen=0"
