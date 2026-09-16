@@ -29,7 +29,7 @@ from tkinter import messagebox, scrolledtext, ttk
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Kali Linux Portable"
-APP_VERSION = "1.2.13"
+APP_VERSION = "1.2.14"
 LXSS_REG_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss"
 DEFAULT_DISTRO = "kali-linux"
 DEFAULT_USER = "kali"
@@ -1396,17 +1396,22 @@ class KaliLauncher:
         Connecting early looks like 'connected but blank screen'.
         """
         wait_sec = float(self.config.get("kex_desktop_wait_sec", 40))
+        user = self.config["wsl_user"]
         self.log(f"XFCE 데스크톱 준비 대기 중... (최대 {wait_sec:.0f}초)")
+        u = shlex.quote(user)
+        # Literal username only — Windows may expand $USER/$u to empty.
         script = (
             "for i in $(seq 1 "
             + str(max(1, int(wait_sec)))
             + "); do "
-            "if pgrep -u \"$USER\" -x xfce4-session >/dev/null 2>&1 "
-            "|| pgrep -u \"$USER\" -x xfwm4 >/dev/null 2>&1 "
-            "|| pgrep -u \"$USER\" -x xfdesktop >/dev/null 2>&1; then "
+            f"if pgrep -u {u} xfce4-session >/dev/null 2>&1 "
+            f"|| pgrep -u {u} xfwm4 >/dev/null 2>&1 "
+            f"|| pgrep -u {u} xfdesktop >/dev/null 2>&1 "
+            f"|| pgrep -u {u} xfce4-panel >/dev/null 2>&1; then "
             "echo DESKTOP_OK; exit 0; fi; "
             "sleep 1; "
             "done; "
+            "pgrep -af 'xfce|Xtigervnc|xfwm' 2>/dev/null | head -20 || true; "
             "echo DESKTOP_MISSING; exit 1"
         )
         result = self._run(
@@ -1429,7 +1434,9 @@ class KaliLauncher:
         if "DESKTOP_OK" in out:
             self.log("  → XFCE 세션 감지됨")
             return True
-        self.log("  → XFCE 세션이 아직 없습니다 (VNC만 열린 검정 화면일 수 있음)")
+        if out:
+            self.log(out[-500:])
+        self.log("  → XFCE 세션이 아직 없습니다 (VNC 서버는 유지한 채 클라이언트 연결)")
         return False
 
     def detect_and_start_xserver(self) -> None:
@@ -1873,17 +1880,17 @@ class KaliLauncher:
                 continue
 
             self.log(f"  → VNC 서버 준비 완료 (포트 {port})")
-            if not self.wait_for_kex_desktop():
-                self.log("  → 데스크톱 미기동 — X11 소켓 강제 재생성 후 KeX 재시작")
+            desktop_ok = self.wait_for_kex_desktop()
+            if not desktop_ok and attempt == 1:
+                self.log("  → 데스크톱 미기동 — 한 번만 KeX를 재시작합니다 (서버를 죽인 채 연결하지 않음)")
                 self._run(self._build_wsl_kex_cmd(["--kill"]), timeout=45.0)
+                self.clean_stale_vnc_state()
                 self._fix_x11_unix_root(force_recreate=True)
-                if attempt == 1:
-                    continue
-                self.log("힌트: WSL에서 아래를 실행해 보세요.")
-                self.log("  kex --kill")
-                self.log("  sudo bash -c 'umount /tmp/.X11-unix 2>/dev/null; rm -rf /tmp/.X11-unix; mkdir -p /tmp/.X11-unix; chmod 1777 /tmp/.X11-unix'")
-                self.log("  unset WAYLAND_DISPLAY WAYLAND_SOCKET; kex --win -s")
-                # Still launch viewer so the user can see whatever is on the session.
+                continue
+
+            if not desktop_ok:
+                self.log("  → XFCE는 아직 없지만 VNC 서버는 살아 있습니다. 클라이언트를 연결합니다.")
+            # CRITICAL: never kex --kill here — that caused localhost:1 WSAECONNREFUSED 10061.
             return self._launch_winkex_client()
 
         self.log("오류: VNC 서버가 시작되지 않아 클라이언트를 실행하지 않습니다.")
