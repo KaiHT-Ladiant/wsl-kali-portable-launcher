@@ -29,7 +29,7 @@ from tkinter import messagebox, scrolledtext, ttk
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Kali Linux Portable"
-APP_VERSION = "1.2.9"
+APP_VERSION = "1.2.10"
 LXSS_REG_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss"
 DEFAULT_DISTRO = "kali-linux"
 DEFAULT_USER = "kali"
@@ -199,7 +199,7 @@ def load_config(paths: dict) -> dict:
         "auto_launch_vnc_viewer": False,
         "kex_vnc_port": 5901,
         "kex_display": ":1",
-        "kex_server_wait_sec": 35,
+        "kex_server_wait_sec": 60,
         "kex_desktop_wait_sec": 40,
         "winkex_fullscreen": False,
         "prefer_vcxsrv": False,
@@ -931,7 +931,7 @@ class KaliLauncher:
                 "--",
                 "bash",
                 "-lc",
-                "test -r /usr/bin/kex && test -r /usr/lib/win-kex/xstartup && echo OK || echo BAD",
+                "test -x /usr/bin/kex && test -f /usr/lib/win-kex/xstartup && echo OK || echo BAD",
             ],
             timeout=45.0,
         )
@@ -1068,6 +1068,78 @@ class KaliLauncher:
 
         self.log("기존 KeX 세션 정리 중...")
         self._run(self._build_wsl_kex_cmd(["--stop"]), timeout=45.0)
+
+    def ensure_winkex_installed(self) -> bool:
+        """
+        Portable images sometimes lose kali-win-kex files after a bad HCS/SSD move.
+        Without /usr/lib/win-kex/xstartup, kex --win starts nothing on :5901.
+        """
+        self.log("Win-KeX 구성 파일 확인 중...")
+        check = (
+            "missing=''; "
+            "test -x /usr/bin/kex || missing=\"$missing kex\"; "
+            "test -f /usr/lib/win-kex/xstartup || missing=\"$missing xstartup\"; "
+            "test -e /usr/lib/win-kex/TigerVNC/win-kex-win-x64 "
+            "|| missing=\"$missing win-kex-win-x64\"; "
+            "if command -v Xtigervnc >/dev/null 2>&1 || test -x /usr/bin/Xtigervnc; then "
+            "true; else missing=\"$missing Xtigervnc\"; fi; "
+            "if [ -z \"$missing\" ]; then echo WINKEX_OK; "
+            "else echo WINKEX_MISSING:$missing; "
+            "ls -ld /usr/lib/win-kex /usr/lib/win-kex/xstartup /usr/bin/kex 2>&1 | head -20; "
+            "fi"
+        )
+        result = self._run(
+            [
+                "wsl",
+                "--cd",
+                "~",
+                "-d",
+                self.config["distro_name"],
+                "-u",
+                self.config["wsl_user"],
+                "--",
+                "bash",
+                "-lc",
+                check,
+            ],
+            timeout=45.0,
+        )
+        out = (result.stdout or "").strip()
+        if "WINKEX_OK" in out:
+            self.log("  → Win-KeX 구성 정상")
+            return True
+
+        self.log(f"  → Win-KeX 누락/손상: {out or result.stderr or '(출력 없음)'}")
+        self.log("  → kali-win-kex 자동 설치 시도 (네트워크 필요, 수 분 소요 가능)...")
+        install = self._run(
+            [
+                "wsl",
+                "--cd",
+                "~",
+                "-d",
+                self.config["distro_name"],
+                "-u",
+                "root",
+                "--",
+                "bash",
+                "-lc",
+                "export DEBIAN_FRONTEND=noninteractive; "
+                "apt-get update -y && apt-get install -y kali-win-kex && echo INSTALL_OK || echo INSTALL_FAIL",
+            ],
+            timeout=900.0,
+        )
+        install_out = f"{install.stdout}\n{install.stderr}".strip()
+        if "INSTALL_OK" in install_out:
+            self.log("  → kali-win-kex 설치 완료")
+            return True
+
+        self.log("오류: Win-KeX가 이 Kali에 없습니다. VNC(5901)가 뜨지 않는 직접 원인입니다.")
+        self.log("노트북에선 되고 이 PC에서만 안 될 때: 이미지 손상 또는 패키지 누락일 수 있습니다.")
+        self.log("WSL에서 수동 설치:")
+        self.log("  sudo apt update && sudo apt install -y kali-win-kex")
+        if install_out:
+            self.log(f"설치 출력:\n{install_out[-800:]}")
+        return False
 
     def apply_xfce_fixes(self) -> None:
         """Keep Win-KeX on X11. WSLg Wayland env breaks Xfce 4.20 inside TigerVNC."""
@@ -1314,15 +1386,26 @@ class KaliLauncher:
         if vcxsrv:
             self._start_vcxsrv(vcxsrv)
 
-    def _build_wsl_kex_cmd(self, kex_args: list[str]) -> list[str]:
+    def _build_wsl_kex_cmd(self, kex_args: list[str], *, capture_log: bool = False) -> list[str]:
         # Strip WSLg Wayland vars so Xfce inside TigerVNC stays on X11.
         quoted = " ".join(shlex.quote(a) for a in kex_args)
-        inner = (
-            "unset WAYLAND_DISPLAY WAYLAND_SOCKET; "
-            "export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11 QT_QPA_PLATFORM=xcb; "
-            "[ -f \"$HOME/.config/win-kex-env.sh\" ] && . \"$HOME/.config/win-kex-env.sh\"; "
-            f"exec kex {quoted}"
-        )
+        if capture_log:
+            inner = (
+                "unset WAYLAND_DISPLAY WAYLAND_SOCKET; "
+                "export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11 QT_QPA_PLATFORM=xcb; "
+                "[ -f \"$HOME/.config/win-kex-env.sh\" ] && . \"$HOME/.config/win-kex-env.sh\"; "
+                "mkdir -p \"$HOME/.cache/kali-launcher\"; "
+                "exec >>\"$HOME/.cache/kali-launcher/kex-start.log\" 2>&1; "
+                f"echo \"==== $(date -Iseconds) kex {quoted} ====\"; "
+                f"exec kex {quoted}"
+            )
+        else:
+            inner = (
+                "unset WAYLAND_DISPLAY WAYLAND_SOCKET; "
+                "export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11 QT_QPA_PLATFORM=xcb; "
+                "[ -f \"$HOME/.config/win-kex-env.sh\" ] && . \"$HOME/.config/win-kex-env.sh\"; "
+                f"exec kex {quoted}"
+            )
         return [
             "wsl",
             "--cd",
@@ -1336,6 +1419,43 @@ class KaliLauncher:
             "-lc",
             inner,
         ]
+
+    def _diagnose_kex_server_failure(self) -> None:
+        self.log("VNC 서버 실패 진단 중...")
+        script = (
+            "echo '--- kex --status ---'; "
+            "kex --status 2>&1 || true; "
+            "echo '--- listeners ---'; "
+            "ss -lntp 2>/dev/null | grep -E '590[0-9]|tiger|vnc' || "
+            "netstat -lntp 2>/dev/null | grep -E '590[0-9]' || true; "
+            "echo '--- processes ---'; "
+            "pgrep -af 'Xtigervnc|tigervnc|win-kex|kex' 2>/dev/null || true; "
+            "echo '--- xstartup ---'; "
+            "ls -la /usr/lib/win-kex/xstartup /usr/bin/kex 2>&1 || true; "
+            "echo '--- kex-start.log ---'; "
+            "tail -n 80 \"$HOME/.cache/kali-launcher/kex-start.log\" 2>/dev/null || "
+            "echo '(no log)'"
+        )
+        result = self._run(
+            [
+                "wsl",
+                "--cd",
+                "~",
+                "-d",
+                self.config["distro_name"],
+                "-u",
+                self.config["wsl_user"],
+                "--",
+                "bash",
+                "-lc",
+                script,
+            ],
+            timeout=60.0,
+        )
+        detail = (result.stdout or result.stderr or "").strip()
+        if detail:
+            self.log(detail[-1500:])
+
 
     def _stage_winkex_files_local(self) -> tuple[str | None, str | None]:
         """
@@ -1521,17 +1641,17 @@ class KaliLauncher:
         if sound:
             server_args.append("-s")
 
-        # Avoid sudo password hang inside kex (read-only /tmp/.X11-unix).
-        # Prefer a real writable dir over a half-broken WSLg mount.
-        if not self.prepare_x11_unix():
-            self.log("경고: /tmp/.X11-unix 복구 실패 — 검정 화면이 날 수 있어 강제 재생성을 재시도합니다.")
-            self._fix_x11_unix_root()
+        # Desktop WSLg often leaves a "writable" mount that still breaks TigerVNC.
+        # Recreate a real 1777 directory before every WIN-mode start.
+        self.log("X11 소켓을 Win-KeX용으로 강제 재생성합니다...")
+        if not self._fix_x11_unix_root(force_recreate=True):
+            self.prepare_x11_unix()
 
         port = int(self.config.get("kex_vnc_port", 5901))
-        wait_sec = float(self.config.get("kex_server_wait_sec", 35))
+        wait_sec = float(self.config.get("kex_server_wait_sec", 60))
 
         for attempt in (1, 2):
-            cmd = self._build_wsl_kex_cmd(server_args)
+            cmd = self._build_wsl_kex_cmd(server_args, capture_log=True)
             self.log(f"Win-KeX 서버 시작... ({' '.join(server_args)}) [시도 {attempt}/2]")
             self.log(f"> {' '.join(cmd)}")
             # CRITICAL: kex --start often never exits. Never use subprocess.run here.
@@ -1545,10 +1665,11 @@ class KaliLauncher:
             self.log(f"VNC 서버 대기 중... (localhost:{port}, 최대 {wait_sec:.0f}초)")
             if not wait_for_tcp_port("127.0.0.1", port, wait_sec):
                 self.log(f"  → 포트 {port} 응답 없음")
+                self._diagnose_kex_server_failure()
                 if attempt == 1:
-                    self.log("  → X11 소켓 재준비 후 한 번 더 시도합니다...")
+                    self.log("  → Win-KeX/X11 재준비 후 한 번 더 시도합니다...")
                     self._run(self._build_wsl_kex_cmd(["--kill"]), timeout=45.0)
-                    self._fix_x11_unix_root()
+                    self._fix_x11_unix_root(force_recreate=True)
                 continue
 
             self.log(f"  → VNC 서버 준비 완료 (포트 {port})")
@@ -1566,7 +1687,7 @@ class KaliLauncher:
             return self._launch_winkex_client()
 
         self.log("오류: VNC 서버가 시작되지 않아 클라이언트를 실행하지 않습니다.")
-        self.log("힌트: WSL에서 /tmp/.X11-unix 가 쓰기 가능해야 합니다.")
+        self.log("힌트: Win-KeX 패키지(xstartup)와 /tmp/.X11-unix 쓰기 가능 여부를 확인하세요.")
         return False
 
     def _start_kex_simple(self, kex_args: list[str]) -> bool:
@@ -1669,6 +1790,9 @@ class KaliLauncher:
                 self.prepare_wsl_session()
 
             if not self.import_wsl_if_needed():
+                return
+
+            if not self.ensure_winkex_installed():
                 return
 
             self.apply_xfce_fixes()
