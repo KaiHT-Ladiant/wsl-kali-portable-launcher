@@ -43,6 +43,13 @@ class PathTests(unittest.TestCase):
     def test_format_adds_prefix(self) -> None:
         self.assertTrue(format_wsl_base_path(r"F:\0.Kali\kali-portable").startswith("\\\\?\\"))
 
+    def test_windows_to_wsl_mnt(self) -> None:
+        from kali_launcher import windows_path_to_wsl_mnt
+
+        converted = windows_path_to_wsl_mnt(r"C:\Users\kaiht\AppData\Local\KaliLauncher\winkex-cache\passwd")
+        self.assertTrue(converted.startswith("/mnt/c/"))
+        self.assertIn("KaliLauncher/winkex-cache/passwd", converted.replace("\\", "/"))
+
 
 class RegistryParseTests(unittest.TestCase):
     def test_parse_lxss_output(self) -> None:

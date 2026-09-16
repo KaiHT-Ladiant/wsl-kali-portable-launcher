@@ -29,7 +29,7 @@ from tkinter import messagebox, scrolledtext, ttk
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Kali Linux Portable"
-APP_VERSION = "1.2.8"
+APP_VERSION = "1.2.9"
 LXSS_REG_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss"
 DEFAULT_DISTRO = "kali-linux"
 DEFAULT_USER = "kali"
@@ -276,6 +276,17 @@ def wait_for_path(path: str, timeout: float = 20.0) -> bool:
             pass
         time.sleep(0.4)
     return False
+
+
+def windows_path_to_wsl_mnt(path: str) -> str:
+    """C:\\Users\\a\\b -> /mnt/c/Users/a/b (for wsl cp, avoids \\\\wsl$)."""
+    abs_path = os.path.abspath(path)
+    drive, tail = os.path.splitdrive(abs_path)
+    letter = drive.rstrip(":\\/").lower()
+    unix_tail = tail.replace("\\", "/")
+    if not unix_tail.startswith("/"):
+        unix_tail = "/" + unix_tail
+    return f"/mnt/{letter}{unix_tail}"
 
 
 def shell_execute(path: str, params: str, cwd: str | None = None) -> bool:
@@ -1313,31 +1324,98 @@ class KaliLauncher:
             inner,
         ]
 
+    def _stage_winkex_files_local(self) -> tuple[str | None, str | None]:
+        """
+        Copy TigerVNC client + passwd to a local NTFS folder via `wsl cp` /mnt/c/...
+
+        Opening \\\\wsl$\\... from Explorer or CreateProcess while the portable VHDX
+        is slow/stuck makes Explorer appear to 'loop' and every wsl.exe call waits
+        for HCS timeouts. Local copies avoid that path entirely.
+        """
+        distro = self.config["distro_name"]
+        user = self.config["wsl_user"]
+        base = os.path.join(
+            os.environ.get("LOCALAPPDATA")
+            or os.environ.get("TEMP")
+            or os.environ.get("USERPROFILE")
+            or "C:\\",
+            "KaliLauncher",
+            "winkex-cache",
+        )
+        try:
+            os.makedirs(base, exist_ok=True)
+        except OSError as exc:
+            self.log(f"로컬 캐시 폴더 생성 실패: {exc}")
+            return None, None
+
+        client_win = os.path.join(base, "win-kex-win-x64.exe")
+        passwd_win = os.path.join(base, "passwd")
+        client_mnt = windows_path_to_wsl_mnt(client_win)
+        passwd_mnt = windows_path_to_wsl_mnt(passwd_win)
+        linux_client = "/usr/lib/win-kex/TigerVNC/win-kex-win-x64"
+        linux_passwd = f"/home/{user}/.config/tigervnc/passwd"
+
+        self.log("Win-KeX 클라이언트를 로컬 디스크로 복사 중 (\\\\wsl$ 미사용)...")
+        script = (
+            f"set -e; "
+            f"test -r {shlex.quote(linux_client)}; "
+            f"test -r {shlex.quote(linux_passwd)}; "
+            f"cp -f {shlex.quote(linux_client)} {shlex.quote(client_mnt)}; "
+            f"cp -f {shlex.quote(linux_passwd)} {shlex.quote(passwd_mnt)}; "
+            f"chmod 644 {shlex.quote(passwd_mnt)} 2>/dev/null || true; "
+            f"echo COPIED"
+        )
+        result = self._run(
+            [
+                "wsl",
+                "--cd",
+                "~",
+                "-d",
+                distro,
+                "-u",
+                "root",
+                "--",
+                "bash",
+                "-lc",
+                script,
+            ],
+            timeout=90.0,
+        )
+        if "COPIED" not in (result.stdout or "") or not (
+            os.path.isfile(client_win) and os.path.isfile(passwd_win)
+        ):
+            detail = (result.stderr or result.stdout or "").strip()
+            self.log(f"  → 로컬 복사 실패: {detail[:400] or '(메시지 없음)'}")
+            return None, None
+
+        self.log(f"  → {client_win}")
+        return client_win, passwd_win
+
     def _launch_winkex_client(self) -> bool:
         """
         Launch win-kex-win-x64 as a Windows process (not via wsl start-client).
 
-        `kex --win --start-client` starts the GUI through WSL interop, then exits.
-        When that short-lived wsl.exe session ends, the TigerVNC window often dies
-        immediately — which matches 'client not visible'. Direct Windows launch keeps it alive.
+        Prefer a local NTFS copy. Never require \\\\wsl$\\ — that path freezes Explorer
+        when the external-SSD VHDX / HCS stack is slow.
         """
         distro = self.config["distro_name"]
         user = self.config["wsl_user"]
 
-        # Wake distro so \\\\wsl$ paths resolve.
-        self._run(
-            ["wsl", "--cd", "~", "-d", distro, "-u", user, "--", "true"],
-            timeout=30.0,
-        )
-
-        client = wsl_unc_path(distro, "/usr/lib/win-kex/TigerVNC/win-kex-win-x64")
-        passwd = wsl_unc_path(distro, f"/home/{user}/.config/tigervnc/passwd")
-        if not client or not wait_for_path(client, 20):
-            self.log("오류: Win-KeX 클라이언트(win-kex-win-x64)를 찾을 수 없습니다.")
-            return False
-        if not passwd or not wait_for_path(passwd, 20):
-            self.log("오류: VNC 비밀번호 파일 없음. WSL에서 kex --passwd 로 설정하세요.")
-            return False
+        client, passwd = self._stage_winkex_files_local()
+        if not client or not passwd:
+            self.log("경고: 로컬 복사 실패 — \\\\wsl$ 폴백은 탐색기를 멈출 수 있어 짧게만 시도합니다.")
+            self._run(
+                ["wsl", "--cd", "~", "-d", distro, "-u", user, "--", "true"],
+                timeout=20.0,
+            )
+            client = wsl_unc_path(distro, "/usr/lib/win-kex/TigerVNC/win-kex-win-x64")
+            passwd = wsl_unc_path(distro, f"/home/{user}/.config/tigervnc/passwd")
+            if not client or not wait_for_path(client, 5):
+                self.log("오류: Win-KeX 클라이언트(win-kex-win-x64)를 찾을 수 없습니다.")
+                return False
+            if not passwd or not wait_for_path(passwd, 5):
+                self.log("오류: VNC 비밀번호 파일 없음. WSL에서 kex --passwd 로 설정하세요.")
+                return False
 
         for image_name in ("win-kex-win-x64.exe", "win-kex-win-x64"):
             if is_process_running(image_name):
@@ -1566,6 +1644,8 @@ class KaliLauncher:
             if vhdx:
                 self.log(f"VHDX: {vhdx} (보존)")
             self.log(f"배포판: {self.config['distro_name']} / 사용자: {self.config['wsl_user']}")
+            self.log("알림: 시작 중 탐색기에서 \\\\wsl$ / Linux 아이콘 / ext4.vhdx 를 열지 마세요.")
+            self.log("알림: 외장 SSD의 VHDX는 첫 기동이 느릴 수 있습니다. 명령이 길면 HCS 대기일 수 있습니다.")
 
             if not self.ensure_wsl_platform():
                 return
