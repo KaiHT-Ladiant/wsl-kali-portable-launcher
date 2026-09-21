@@ -89,5 +89,33 @@ class HcsDetectionTests(unittest.TestCase):
         self.assertTrue(launcher._wsl_output_unhealthy(detail))
 
 
+class VhdxCorruptMountTests(unittest.TestCase):
+    def test_detects_0x80070570_korean(self) -> None:
+        from kali_launcher import KaliLauncher
+
+        launcher = KaliLauncher.__new__(KaliLauncher)
+        detail = (
+            "디스크 'H:\\0.Kali\\kali-portable\\ext4.vhdx'을(를) WSL2에 연결하지 못함: "
+            "파일 또는 디렉터리가 손상되었기 때문에 읽을 수 없습니다.\n"
+            "오류 코드: Wsl/Service/CreateInstance/MountDisk/HCS/0x80070570"
+        )
+        self.assertTrue(launcher._is_vhdx_corrupt_mount(detail))
+        self.assertTrue(launcher._wsl_output_unhealthy(detail))
+
+    def test_ignores_unrelated_mount_noise(self) -> None:
+        from kali_launcher import KaliLauncher
+
+        launcher = KaliLauncher.__new__(KaliLauncher)
+        self.assertFalse(launcher._is_vhdx_corrupt_mount("MountDisk still starting"))
+        self.assertFalse(launcher._is_hcs_timeout("MountDisk still starting"))
+
+    def test_drive_hint_uses_current_path(self) -> None:
+        from kali_launcher import KaliLauncher
+
+        launcher = KaliLauncher.__new__(KaliLauncher)
+        launcher.paths = {"wsl_install_dir": r"H:\0.Kali\kali-portable"}
+        self.assertEqual(launcher._current_ssd_drive_hint(), "H:")
+
+
 if __name__ == "__main__":
     unittest.main()

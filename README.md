@@ -1,6 +1,6 @@
 # Kali Linux Portable Launcher
 
-![Version](https://img.shields.io/badge/Version-1.2.14-blue) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Version](https://img.shields.io/badge/Version-1.2.15-blue) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A Windows GUI client for running **WSL Kali Linux** from a portable external SSD.  
 Start and stop Win-KeX (TigerVNC) sessions with one click.
@@ -107,6 +107,7 @@ Create `kali_launcher_config.json` next to the executable (this file is local an
 | VNC port 5901 never opens / `NO_XSTARTUP` | Not a new Kali download. Same `ext4.vhdx` is kept. Check `ls -la /usr/lib/win-kex/xstartup`. v1.2.11+ also tries the WSL eth0 IP if localhost forwarding fails on this PC. Optional in-place package repair only if `"auto_install_winkex": true`. |
 | TigerVNC `localhost:1` refused after "완료" | Launcher killed VNC while waiting for XFCE, then opened the client. Fixed in v1.2.14 — keep the server running when connecting. |
 | TigerVNC `172.x.x.x:1` connection refused (10061) | Do not connect to the WSL eth0 IP. Win-KeX listens on localhost inside WSL. v1.2.13+ always uses `localhost:1`. Ensure `%USERPROFILE%\\.wslconfig` has `localhostForwarding=true`, then `wsl --shutdown`. |
+| `MountDisk` / `0x80070570` / VHDX corrupted and unreadable | WSL cannot attach `ext4.vhdx` (common after unclean unplug or NTFS compression). v1.2.15+ clears attrib/compact, optionally runs `e2fsck` via another distro, and stops useless LxssManager loops. **Never delete** the VHDX. |
 | `kex` asks for sudo / read-only `/tmp/.X11-unix` / bad pid file | Desktop WSLg remounts X11 RO and leftover `Z-sys.localdomain:1.pid` from the laptop breaks TigerVNC. v1.2.12 mounts a writable tmpfs, adds mount NOPASSWD, and clears stale pid/lock files. |
 | `/tmp/.X11-unix` read-only / VNC never starts | Fixed automatically in v1.2.5 via root remount after WSL health check |
 

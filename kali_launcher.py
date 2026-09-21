@@ -29,7 +29,7 @@ from tkinter import messagebox, scrolledtext, ttk
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Kali Linux Portable"
-APP_VERSION = "1.2.14"
+APP_VERSION = "1.2.15"
 LXSS_REG_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss"
 DEFAULT_DISTRO = "kali-linux"
 DEFAULT_USER = "kali"
@@ -859,6 +859,11 @@ class KaliLauncher:
             "응답을 받지 못",
             "operation timed out",
             "timed out",
+            "손상되었기 때문에",
+            "corrupted and unreadable",
+            "mountdisk",
+            "mountvhd",
+            "0x80070570",
         )
         return any(marker in lowered for marker in markers)
 
@@ -873,6 +878,172 @@ class KaliLauncher:
                 "시간이 초과",
                 "operation timed out",
             )
+        )
+
+    def _is_vhdx_corrupt_mount(self, text: str) -> bool:
+        """WSL cannot attach ext4.vhdx (often after unclean unplug / NTFS compression)."""
+        lowered = (text or "").lower().replace("-", "").replace("_", "")
+        if "0x80070570" in lowered:
+            return True
+        corrupt = any(
+            token in lowered
+            for token in (
+                "손상되었기때문에",
+                "corruptedandunreadable",
+                "errorfilecorrupt",
+            )
+        )
+        mount_ctx = any(
+            token in lowered
+            for token in (
+                "mountdisk",
+                "mountvhd",
+                "createinstance/mountdisk",
+                "ext4.vhdx",
+            )
+        )
+        return corrupt and mount_ctx
+
+    def _current_ssd_drive_hint(self) -> str:
+        path = (self.paths.get("wsl_install_dir") or "").strip()
+        drive = os.path.splitdrive(path)[0]
+        if drive:
+            return drive
+        # posix hosts (unit tests) do not split "H:\..." via os.path.splitdrive
+        match = re.match(r"^(?:\\\\\?\\)?([A-Za-z]:)", path)
+        if match:
+            return match.group(1)
+        return "(알 수 없음)"
+
+    def prepare_vhdx_file_windows(self) -> bool:
+        """
+        Clear NTFS read-only/compression attributes that commonly trigger
+        MountDisk/0x80070570. Never deletes or replaces ext4.vhdx.
+        """
+        vhdx = find_vhdx(self.paths["wsl_install_dir"])
+        if not vhdx:
+            self.log(
+                f"  → ext4.vhdx를 찾을 수 없습니다: "
+                f"{self.paths['wsl_install_dir']}\\{VHDX_FILENAME}"
+            )
+            return False
+
+        try:
+            size = os.path.getsize(vhdx)
+        except OSError as exc:
+            self.log(f"  → VHDX 크기 확인 실패: {exc}")
+            return False
+
+        if size < 1024 * 1024:
+            self.log(f"  → VHDX 크기가 비정상적으로 작습니다 ({size} bytes).")
+            return False
+
+        self.log(
+            f"  → VHDX Windows 준비 (삭제 없음): {vhdx} "
+            f"({max(1, size // (1024 * 1024))} MB)"
+        )
+        self._run(["attrib", "-R", "-S", "-H", vhdx], timeout=30.0)
+        # NTFS compression frequently breaks WSL2 VHDX attach on portable drives.
+        self._run(["compact", "/U", "/I", "/Q", vhdx], timeout=900.0)
+
+        try:
+            with open(vhdx, "rb") as handle:
+                handle.read(4096)
+        except OSError as exc:
+            self.log(f"  → VHDX를 Windows에서도 읽을 수 없습니다: {exc}")
+            return False
+
+        self.log("  → VHDX Windows 읽기 확인 OK")
+        return True
+
+    def _helper_wsl_distros(self) -> list[str]:
+        mine = (self.config.get("distro_name") or "").lower()
+        return [name for name in list_wsl_distros() if name.lower() != mine]
+
+    def repair_vhdx_with_e2fsck(self) -> bool:
+        """
+        Attach the portable VHDX as a bare disk and run e2fsck from another
+        WSL distro. Never deletes/unregisters kali-linux or its VHDX.
+        """
+        vhdx = find_vhdx(self.paths["wsl_install_dir"])
+        if not vhdx:
+            return False
+
+        helpers = self._helper_wsl_distros()
+        if not helpers:
+            self.log("  → e2fsck용 다른 WSL 배포판이 없어 파일시스템 점검은 건너뜁니다.")
+            self.log("  → (원하시면 Ubuntu 등 보조 배포판을 설치한 뒤 다시 시작하세요)")
+            return False
+
+        helper = helpers[0]
+        self.log(f"  → VHDX bare mount 후 e2fsck 시도 (helper: {helper}, VHDX 삭제 없음)")
+        self._run(["wsl", "--shutdown"], timeout=90.0)
+        time.sleep(3)
+
+        mount = self._run(
+            ["wsl", "--mount", vhdx, "--vhd", "--bare"],
+            timeout=120.0,
+        )
+        mount_text = f"{mount.stdout}\n{mount.stderr}"
+        if mount.returncode != 0 or self._wsl_output_unhealthy(mount_text):
+            detail = (mount.stderr or mount.stdout or "").strip()
+            self.log(f"  → wsl --mount --bare 실패: {detail[:400] or '(출력 없음)'}")
+            self._run(["wsl", "--unmount", vhdx], timeout=60.0)
+            return False
+
+        # Prefer non-root disks; WSL VHDX is usually /dev/sdX or /dev/sdX1.
+        script = (
+            "set +e; "
+            "found=''; "
+            "for dev in /dev/sd[b-z] /dev/sd[b-z][0-9]* /dev/sd[a-z] /dev/sd[a-z][0-9]*; do "
+            "  [ -b \"$dev\" ] || continue; "
+            "  root_src=$(findmnt -n -o SOURCE / 2>/dev/null || true); "
+            "  case \"$root_src\" in \"$dev\"*) continue ;; esac; "
+            "  typ=$(blkid -o value -s TYPE \"$dev\" 2>/dev/null || true); "
+            "  case \"$typ\" in ext2|ext3|ext4) found=\"$dev\"; break ;; esac; "
+            "done; "
+            "if [ -z \"$found\" ]; then echo NO_EXT_DEVICE; exit 2; fi; "
+            "echo REPAIR_TARGET=$found; "
+            "e2fsck -fy \"$found\"; rc=$?; "
+            "echo E2FSCK_EXIT=$rc; "
+            "exit 0"
+        )
+        repair = self._run(
+            ["wsl", "-d", helper, "-u", "root", "--", "bash", "-lc", script],
+            timeout=900.0,
+        )
+        repair_out = ((repair.stdout or "") + "\n" + (repair.stderr or "")).strip()
+        if repair_out:
+            self.log(f"  → e2fsck 출력:\n{repair_out[:800]}")
+
+        self._run(["wsl", "--unmount", vhdx], timeout=60.0)
+        self._run(["wsl", "--shutdown"], timeout=90.0)
+        time.sleep(2)
+
+        if "NO_EXT_DEVICE" in repair_out:
+            self.log("  → bare mount된 ext 파티션을 찾지 못했습니다.")
+            return False
+        if "E2FSCK_EXIT=" not in repair_out and repair.returncode != 0:
+            self.log("  → e2fsck 실행 실패")
+            return False
+
+        self.log("  → e2fsck 완료 (VHDX 보존)")
+        return True
+
+    def _wake_wsl_true(self, *, timeout: float = 90.0) -> RunResult:
+        return self._run(
+            [
+                "wsl",
+                "--cd",
+                "~",
+                "-d",
+                self.config["distro_name"],
+                "-u",
+                self.config["wsl_user"],
+                "--",
+                "true",
+            ],
+            timeout=timeout,
         )
 
     def sync_portable_base_path(self) -> bool:
@@ -963,6 +1134,7 @@ class KaliLauncher:
         time.sleep(3)
 
     def _log_wsl_recovery_hints(self, detail: str) -> None:
+        drive = self._current_ssd_drive_hint()
         self.log("이 PC에서만 실패할 때 흔한 원인:")
         self.log("  1) 외장 SSD 드라이브 문자가 WSL 등록 경로와 다름 (BasePath)")
         self.log("  2) BIOS/Windows 가상화(Virtual Machine Platform) 미활성")
@@ -970,9 +1142,22 @@ class KaliLauncher:
         self.log("  4) 다른 창에서 같은 kali-linux 세션이 잠금 중")
         lowered = (detail or "").lower()
         if any(token in lowered for token in ("path", "경로", "cannot find", "찾을 수 없", "disk", "디스크")):
-            self.log("힌트: 등록 경로/드라이브 문자 문제 가능성이 큽니다. SSD가 F:로 보이는지 확인하세요.")
+            self.log(
+                f"힌트: 등록 경로/드라이브 문자 문제 가능성이 큽니다. "
+                f"SSD가 {drive} 로 보이는지 확인하세요."
+            )
         if any(token in lowered for token in ("virtual", "hypervisor", "0x80370102", "가상")):
             self.log("힌트: Windows 기능에서 'Virtual Machine Platform'을 켠 뒤 재부팅하세요.")
+        if self._is_vhdx_corrupt_mount(detail):
+            self.log("힌트: MountDisk/0x80070570 — WSL이 ext4.vhdx를 붙이지 못했습니다.")
+            self.log("  · ext4.vhdx는 삭제하지 마세요. 이 런처도 삭제/교체하지 않습니다.")
+            self.log("  · NTFS 압축·읽기전용이면 attrib/compact 해제 후 다시 시도합니다.")
+            self.log("  · 이전 PC에서 「정지」 없이 SSD를 뽑았다면 e2fsck가 필요할 수 있습니다.")
+            self.log("  · 탐색기에서 \\\\wsl$ / ext4.vhdx 를 연 채로 두지 마세요.")
+            self.log(
+                f"  · 최후 수단: VHDX 백업 후 {drive}\\ 의 kali-final.tar 로 "
+                "재등록을 검토 (기존 VHDX 덮어쓰기 금지)."
+            )
         if self._is_hcs_timeout(detail):
             self.log("힌트: HCS_E_CONNECTION_TIMEOUT — WSL VM이 VHDX를 마운트하지 못했습니다.")
             self.log("  · 런처/시작을 반복하지 마세요 (탐색기가 멈출 수 있음).")
@@ -998,20 +1183,7 @@ class KaliLauncher:
             if attempt >= 2:
                 self._restart_lxss_manager()
 
-            wake = self._run(
-                [
-                    "wsl",
-                    "--cd",
-                    "~",
-                    "-d",
-                    self.config["distro_name"],
-                    "-u",
-                    self.config["wsl_user"],
-                    "--",
-                    "true",
-                ],
-                timeout=90.0,
-            )
+            wake = self._wake_wsl_true(timeout=90.0)
             wake_text = f"{wake.stdout}\n{wake.stderr}"
             if wake.returncode == 0 and not self._wsl_output_unhealthy(wake_text):
                 self.log("  → WSL 재시작 완료")
@@ -1019,6 +1191,38 @@ class KaliLauncher:
 
             last_detail = (wake.stderr or wake.stdout or "").strip()
             self.log(f"  → 시도 {attempt} 실패: {last_detail or '(메시지 없음)'}")
+
+            if self._is_vhdx_corrupt_mount(last_detail):
+                # Shutdown/LxssManager loops cannot fix ERROR_FILE_CORRUPT mounts.
+                self.log(
+                    "  → VHDX MountDisk 손상/읽기 불가(0x80070570) 감지 "
+                    "— 삭제 없이 Windows 준비·복구로 전환"
+                )
+                prepared = self.prepare_vhdx_file_windows()
+                if prepared:
+                    self._run(["wsl", "--shutdown"], timeout=90.0)
+                    time.sleep(3)
+                    wake2 = self._wake_wsl_true(timeout=120.0)
+                    wake2_text = f"{wake2.stdout}\n{wake2.stderr}"
+                    if wake2.returncode == 0 and not self._wsl_output_unhealthy(wake2_text):
+                        self.log("  → VHDX 준비 후 WSL 재시작 완료")
+                        return True
+                    last_detail = (wake2.stderr or wake2.stdout or last_detail).strip()
+                    self.log(f"  → 준비 후 재시도 실패: {last_detail or '(메시지 없음)'}")
+
+                if self._is_vhdx_corrupt_mount(last_detail) or not prepared:
+                    if self.repair_vhdx_with_e2fsck():
+                        wake3 = self._wake_wsl_true(timeout=120.0)
+                        wake3_text = f"{wake3.stdout}\n{wake3.stderr}"
+                        if wake3.returncode == 0 and not self._wsl_output_unhealthy(wake3_text):
+                            self.log("  → e2fsck 후 WSL 재시작 완료")
+                            return True
+                        last_detail = (wake3.stderr or wake3.stdout or last_detail).strip()
+                        self.log(f"  → e2fsck 후 재시도 실패: {last_detail or '(메시지 없음)'}")
+
+                self.log("  → VHDX 손상 마운트 — LxssManager 반복 재시도를 중단합니다.")
+                break
+
             if self._is_hcs_timeout(last_detail) or wake.returncode == 124:
                 # Extra hammering makes Explorer/Vmmem worse on external SSDs.
                 self.log("  → HCS 타임아웃 — 추가 재시도를 중단하고 안내만 표시합니다.")
@@ -1047,6 +1251,7 @@ class KaliLauncher:
             return True
         self.log("오류: WSL이 정상 상태로 복구되지 않았습니다.")
         self.log("  시작 버튼을 반복하지 말고, SSD 연결 확인 후 PC를 재부팅하세요.")
+        self.log("  MountDisk/0x80070570 이면 NTFS 압축 해제·e2fsck 후 다시 시도하세요 (VHDX 삭제 금지).")
         self.log("  계속 HCS_E_CONNECTION_TIMEOUT이면 ext4.vhdx 점검 또는 tar 재등록이 필요할 수 있습니다.")
         return False
 
