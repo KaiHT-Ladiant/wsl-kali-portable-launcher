@@ -1,6 +1,6 @@
 # Kali Linux Portable Launcher
 
-![Version](https://img.shields.io/badge/Version-1.2.17-blue) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Version](https://img.shields.io/badge/Version-1.2.18-blue) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A Windows GUI client for running **WSL Kali Linux** from a portable external SSD.  
 Start and stop Win-KeX (TigerVNC) sessions with one click.
@@ -99,7 +99,7 @@ Create `kali_launcher_config.json` next to the executable (this file is local an
 | Connection refused on VNC port | Confirm `kex_vnc_port` is `5901` |
 | Fails after unplugging external SSD | Use **Stop Kali Linux** first (v1.2.5+ shuts down WSL). If it still fails, restart the launcher — it auto-recovers. |
 | Works on another PC, fails on this PC | Usually the SSD drive letter changed and WSL `BasePath` still points at the old path (e.g. still `F:` while Windows assigned `H:`). v1.2.17+ remaps config paths to the exe drive and always logs/syncs `BasePath` to the current letter (never deletes the VHDX). Also confirm Virtual Machine Platform is enabled. |
-| `MountDisk` / `0x80070570` / VHDX corrupted and unreadable | WSL cannot attach `ext4.vhdx` (common after unclean unplug, NTFS compression, or stale BasePath). v1.2.17+ clears attrib/compact, force-syncs BasePath to the current drive, and stops useless LxssManager loops. **Never delete** the VHDX. |
+| `MountDisk` / `0x80070570` / VHDX corrupted and unreadable | When BasePath already matches the current drive, this is **not** a path bug — WSL/HCS cannot attach `ext4.vhdx` (dirty VHDX, USB/controller, or virtualization policy). v1.2.18+ states that clearly, probes Hyper-V attach, and stops misleading “drive letter” hints. **Never delete** the VHDX. |
 | Log shows `WSL 재시작 실패` with garbled text | Fixed in v1.2.6 (UTF-16/Korean console decoding). Re-run with the new build to see the real Windows error. |
 | `HCS_E_CONNECTION_TIMEOUT` / Explorer freezes | Do **not** spam Start. Run `wsl --shutdown`, avoid opening `\\wsl$`, reboot Windows, then try once. If it still times out, the VHDX may be unhealthy — keep a copy of `ext4.vhdx` and consider re-import from `kali-final.tar`. |
 | VNC connects but screen is blank/black | XFCE did not start. v1.2.8+ recreates `/tmp/.X11-unix` and waits for the desktop. Manual fix: `kex --kill`, recreate `/tmp/.X11-unix` as a 1777 directory, then `kex --win -s`. |

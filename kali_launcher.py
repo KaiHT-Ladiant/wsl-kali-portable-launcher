@@ -29,7 +29,7 @@ from tkinter import messagebox, scrolledtext, ttk
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Kali Linux Portable"
-APP_VERSION = "1.2.17"
+APP_VERSION = "1.2.18"
 LXSS_REG_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss"
 DEFAULT_DISTRO = "kali-linux"
 DEFAULT_USER = "kali"
@@ -572,10 +572,15 @@ def normalize_wsl_base_path(path: str | None) -> str:
 
 
 def format_wsl_base_path(path: str) -> str:
+    """
+    Store BasePath as a normal drive path (H:\\...).
+    Avoid forcing \\\\?\\ — some WSL builds already register plain paths, and
+    rewriting to \\\\?\\ after a MountDisk failure only confuses diagnostics.
+    """
     normalized = os.path.normpath(path)
     if normalized.startswith("\\\\?\\"):
-        return normalized
-    return "\\\\?\\" + normalized
+        normalized = normalized[4:]
+    return normalized
 
 
 def parse_lxss_registry_output(text: str) -> list[dict]:
@@ -1026,13 +1031,87 @@ class KaliLauncher:
 
         try:
             with open(vhdx, "rb") as handle:
+                magic = handle.read(8)
+                handle.seek(0)
                 handle.read(4096)
         except OSError as exc:
             self.log(f"  → VHDX를 Windows에서도 읽을 수 없습니다: {exc}")
             return False
 
-        self.log("  → VHDX Windows 읽기 확인 OK")
+        if magic == b"vhdxfile":
+            self.log("  → VHDX 시그니처 OK (vhdxfile)")
+        else:
+            self.log(
+                f"  → 경고: VHDX 시그니처 이상 ({magic!r}) — 파일이 손상되었을 수 있습니다."
+            )
+
+        self.log("  → VHDX Windows 읽기 확인 OK (HCS 부착 성공과는 별개)")
         return True
+
+    def diagnose_vhdx_hyperv_attach(self) -> None:
+        """
+        Best-effort Hyper-V attach probe / Repair-VHD (never deletes VHDX).
+        Explains 0x80070570 when BasePath is already correct.
+        """
+        vhdx = find_vhdx(self.paths["wsl_install_dir"])
+        if not vhdx:
+            return
+
+        self.log("  → Hyper-V/VHDX 부착 진단 (삭제 없음)...")
+        # Virtual Machine Platform presence (common on work laptops).
+        feature = self._run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "(Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform "
+                "-ErrorAction SilentlyContinue).State",
+            ],
+            timeout=60.0,
+        )
+        feature_text = (feature.stdout or feature.stderr or "").strip()
+        if feature_text:
+            self.log(f"  → VirtualMachinePlatform: {feature_text[:120]}")
+
+        # Get-VHD / Repair-VHD need Hyper-V PowerShell module (often absent on Home).
+        script = (
+            f"$ErrorActionPreference='Continue'; "
+            f"$p = '{vhdx.replace(chr(39), chr(39)+chr(39))}'; "
+            "try { Import-Module Hyper-V -ErrorAction Stop } catch { "
+            "  Write-Output 'HYPERV_MODULE=missing'; exit 0 "
+            "}; "
+            "try { $v = Get-VHD -Path $p; "
+            "  Write-Output ('VHD_OK size=' + $v.FileSize + ' type=' + $v.VhdType + "
+            "    ' attached=' + $v.Attached); "
+            "} catch { Write-Output ('GET_VHD_FAIL=' + $_.Exception.Message); } "
+            "try { "
+            "  Repair-VHD -Path $p -Mode Scan -ErrorAction Stop; "
+            "  Write-Output 'REPAIR_SCAN=ok'; "
+            "} catch { Write-Output ('REPAIR_SCAN_FAIL=' + $_.Exception.Message); } "
+            "try { "
+            "  Mount-VHD -Path $p -ReadOnly -ErrorAction Stop; "
+            "  Write-Output 'MOUNT_VHD=ok'; "
+            "  Dismount-VHD -Path $p -ErrorAction SilentlyContinue; "
+            "} catch { Write-Output ('MOUNT_VHD_FAIL=' + $_.Exception.Message); }"
+        )
+        result = self._run(
+            ["powershell", "-NoProfile", "-Command", script],
+            timeout=600.0,
+        )
+        out = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+        if out:
+            self.log(f"  → Hyper-V 진단:\n{out[:900]}")
+        else:
+            self.log("  → Hyper-V 진단 출력 없음 (모듈/권한 부족 가능)")
+
+    def _base_path_already_current(self) -> bool:
+        install_dir = self.paths.get("wsl_install_dir") or ""
+        entry = get_wsl_registry_entry(self.config["distro_name"])
+        if not entry:
+            return False
+        registered = normalize_wsl_base_path(entry.get("base_path"))
+        expected = normalize_wsl_base_path(install_dir)
+        return bool(registered and expected and registered == expected)
 
     def _wake_wsl_true(self, *, timeout: float = 90.0) -> RunResult:
         return self._run(
@@ -1172,35 +1251,59 @@ class KaliLauncher:
 
     def _log_wsl_recovery_hints(self, detail: str) -> None:
         drive = self._current_ssd_drive_hint()
-        self.log("이 PC에서만 실패할 때 흔한 원인:")
-        self.log("  1) 외장 SSD 드라이브 문자가 WSL 등록 경로와 다름 (BasePath)")
-        self.log("  2) BIOS/Windows 가상화(Virtual Machine Platform) 미활성")
-        self.log("  3) 이전 PC에서 「정지」 없이 SSD를 뽑아 VHDX가 불안정")
-        self.log("  4) 다른 창에서 같은 kali-linux 세션이 잠금 중")
+        base_ok = self._base_path_already_current()
+        corrupt = self._is_vhdx_corrupt_mount(detail)
+
+        if corrupt and base_ok:
+            self.log("======= 원인 정리 =======")
+            self.log("BasePath/드라이브 문자는 이미 현재 PC와 일치합니다. (경로 문제가 아님)")
+            self.log(
+                "실패 지점: WSL2 Hyper-V가 ext4.vhdx 를 MountDisk 하는 단계 "
+                "(오류 0x80070570 = ERROR_FILE_CORRUPT)."
+            )
+            self.log(
+                "Windows에서 파일 앞부분 읽기가 되어도, HCS가 VHDX를 가상 디스크로 "
+                "붙이지 못하면 이 오류가 납니다."
+            )
+            self.log("가능한 실제 원인:")
+            self.log("  1) 이전 PC에서 「정지」 없이 SSD를 뽑아 VHDX/ext4가 dirty·손상")
+            self.log("  2) 이 PC의 USB/외장 SSD 컨트롤러·쓰기 캐시로 VHDX 부착 실패")
+            self.log("  3) Virtual Machine Platform / 가상화 미활성·정책 제한 (업무용 PC)")
+            self.log("  4) 백신/EDR이 ext4.vhdx 잠금")
+            self.log("권장 순서 (VHDX 삭제 금지):")
+            self.log("  · Windows 재부팅 1회 → 런처 「시작」 한 번만")
+            self.log("  · 가능하면 SSD를 USB 3.x 직접 포트에 연결 (허브 금지)")
+            self.log("  · 관리자 PowerShell: Repair-VHD -Path '...\\ext4.vhdx' -Mode Scan")
+            self.log(
+                f"  · 최후: ext4.vhdx 를 다른 폴더로 백업(이름 변경)한 뒤 "
+                f"{drive}\\kali-final.tar 로 재등록 (원본 VHDX 덮어쓰기 금지)"
+            )
+        else:
+            self.log("이 PC에서만 실패할 때 흔한 원인:")
+            self.log("  1) 외장 SSD 드라이브 문자가 WSL 등록 경로와 다름 (BasePath)")
+            self.log("  2) BIOS/Windows 가상화(Virtual Machine Platform) 미활성")
+            self.log("  3) 이전 PC에서 「정지」 없이 SSD를 뽑아 VHDX가 불안정")
+            self.log("  4) 다른 창에서 같은 kali-linux 세션이 잠금 중")
+
         lowered = (detail or "").lower()
-        if any(token in lowered for token in ("path", "경로", "cannot find", "찾을 수 없", "disk", "디스크")):
+        if (not base_ok) and any(
+            token in lowered for token in ("path", "경로", "cannot find", "찾을 수 없", "disk", "디스크")
+        ):
             self.log(
                 f"힌트: 등록 경로/드라이브 문자 문제 가능성이 큽니다. "
                 f"SSD가 {drive} 로 보이는지 확인하세요."
             )
         if any(token in lowered for token in ("virtual", "hypervisor", "0x80370102", "가상")):
             self.log("힌트: Windows 기능에서 'Virtual Machine Platform'을 켠 뒤 재부팅하세요.")
-        if self._is_vhdx_corrupt_mount(detail):
+        if corrupt and not base_ok:
             self.log("힌트: MountDisk/0x80070570 — WSL이 ext4.vhdx를 붙이지 못했습니다.")
             self.log("  · ext4.vhdx는 삭제하지 마세요. 이 런처도 삭제/교체하지 않습니다.")
-            self.log("  · NTFS 압축·읽기전용이면 attrib/compact 해제 후 다시 시도합니다.")
-            self.log("  · 이전 PC에서 「정지」 없이 SSD를 뽑지 마세요. 실패 시 PC 재부팅 후 한 번만 재시도하세요.")
-            self.log("  · 탐색기에서 \\\\wsl$ / ext4.vhdx 를 연 채로 두지 마세요.")
-            self.log(
-                f"  · 최후 수단: VHDX 백업 후 {drive}\\ 의 kali-final.tar 로 "
-                "재등록을 검토 (기존 VHDX 덮어쓰기 금지)."
-            )
+            self.log("  · BasePath를 현재 드라이브로 맞춘 뒤 다시 시도합니다.")
         if self._is_hcs_timeout(detail):
             self.log("힌트: HCS_E_CONNECTION_TIMEOUT — WSL VM이 VHDX를 마운트하지 못했습니다.")
             self.log("  · 런처/시작을 반복하지 마세요 (탐색기가 멈출 수 있음).")
             self.log("  · \\\\wsl$ / \\\\wsl.localhost 폴더는 열지 마세요.")
             self.log("  · wsl --shutdown 후 Windows를 한 번 재부팅하세요.")
-            self.log("  · 그래도 실패하면 ext4.vhdx 손상 가능 — kali-final.tar로 재등록을 검토하세요.")
         status = self._run(["wsl", "-l", "-v"], timeout=30.0)
         status_text = (status.stdout or status.stderr or "").strip()
         if status_text:
@@ -1235,6 +1338,13 @@ class KaliLauncher:
                     "  → VHDX MountDisk 손상/읽기 불가(0x80070570) 감지 "
                     "— 삭제 없이 Windows 쪽 VHDX 준비로 전환"
                 )
+                base_already_ok = self._base_path_already_current()
+                if base_already_ok:
+                    self.log(
+                        "  → BasePath는 이미 현재 드라이브와 일치합니다. "
+                        "경로 문제가 아니라 VHDX/HCS 부착 실패로 판단합니다."
+                    )
+
                 prepared = self.prepare_vhdx_file_windows()
                 if prepared:
                     self._run(["wsl", "--shutdown"], timeout=90.0)
@@ -1247,18 +1357,24 @@ class KaliLauncher:
                     last_detail = (wake2.stderr or wake2.stdout or last_detail).strip()
                     self.log(f"  → 준비 후 재시도 실패: {last_detail or '(메시지 없음)'}")
 
-                # Stale BasePath (other PC drive letter) often surfaces as MountDisk errors.
-                self.log("  → 현재 실행 드라이브로 WSL BasePath 강제 재동기화")
-                if self.sync_portable_base_path(force=True):
-                    wake3 = self._wake_wsl_true(timeout=120.0)
-                    wake3_text = f"{wake3.stdout}\n{wake3.stderr}"
-                    if wake3.returncode == 0 and not self._wsl_output_unhealthy(wake3_text):
-                        self.log("  → BasePath 강제 동기화 후 WSL 재시작 완료")
-                        return True
-                    last_detail = (wake3.stderr or wake3.stdout or last_detail).strip()
-                    self.log(f"  → BasePath 강제 동기화 후 실패: {last_detail or '(메시지 없음)'}")
+                if not base_already_ok:
+                    self.log("  → 현재 실행 드라이브로 WSL BasePath 강제 재동기화")
+                    if self.sync_portable_base_path(force=True):
+                        wake3 = self._wake_wsl_true(timeout=120.0)
+                        wake3_text = f"{wake3.stdout}\n{wake3.stderr}"
+                        if wake3.returncode == 0 and not self._wsl_output_unhealthy(wake3_text):
+                            self.log("  → BasePath 강제 동기화 후 WSL 재시작 완료")
+                            return True
+                        last_detail = (wake3.stderr or wake3.stdout or last_detail).strip()
+                        self.log(
+                            f"  → BasePath 강제 동기화 후 실패: {last_detail or '(메시지 없음)'}"
+                        )
+                else:
+                    # Avoid rewriting H: → \\?\H: which only changes the error path text.
+                    self.log("  → BasePath 강제 재기록 생략 (이미 일치)")
 
-                self.log("  → VHDX 손상 마운트 — LxssManager 반복 재시도를 중단합니다.")
+                self.diagnose_vhdx_hyperv_attach()
+                self.log("  → VHDX/HCS 부착 실패 — LxssManager 반복 재시도를 중단합니다.")
                 break
 
             if self._is_hcs_timeout(last_detail) or wake.returncode == 124:

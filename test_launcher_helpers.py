@@ -40,8 +40,17 @@ class PathTests(unittest.TestCase):
             normalize_wsl_base_path(r"F:\0.Kali\kali-portable"),
         )
 
-    def test_format_adds_prefix(self) -> None:
-        self.assertTrue(format_wsl_base_path(r"F:\0.Kali\kali-portable").startswith("\\\\?\\"))
+    def test_format_plain_drive_path(self) -> None:
+        from kali_launcher import format_wsl_base_path
+
+        self.assertEqual(
+            format_wsl_base_path(r"F:\0.Kali\kali-portable"),
+            r"F:\0.Kali\kali-portable",
+        )
+        self.assertEqual(
+            format_wsl_base_path(r"\\?\H:\0.Kali\kali-portable"),
+            r"H:\0.Kali\kali-portable",
+        )
 
     def test_windows_to_wsl_mnt(self) -> None:
         from kali_launcher import windows_path_to_wsl_mnt
