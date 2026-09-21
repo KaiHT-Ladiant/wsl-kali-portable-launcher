@@ -29,7 +29,7 @@ from tkinter import messagebox, scrolledtext, ttk
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Kali Linux Portable"
-APP_VERSION = "1.2.16"
+APP_VERSION = "1.2.17"
 LXSS_REG_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss"
 DEFAULT_DISTRO = "kali-linux"
 DEFAULT_USER = "kali"
@@ -176,11 +176,89 @@ def resolve_paths() -> dict:
     }
 
 
+def windows_drive_letter(path: str | None) -> str:
+    """
+    Return 'H:' style drive from a Windows path.
+    Works even when unit tests run on Linux (os.path.splitdrive ignores 'H:\\...').
+    """
+    raw = (path or "").strip().strip('"').replace("/", "\\")
+    if not raw:
+        return ""
+    match = re.match(r"^(?:\\\\\?\\)?([A-Za-z]:)", raw)
+    if match:
+        return match.group(1).upper()
+    drive = os.path.splitdrive(raw)[0]
+    return drive.upper() if drive else ""
+
+
+def remap_windows_path_drive(path: str | None, new_drive: str) -> str:
+    """Replace only the drive letter of a Windows path (keep the rest)."""
+    raw = (path or "").strip().strip('"')
+    if not raw or not new_drive:
+        return raw
+    drive = new_drive if new_drive.endswith(":") else f"{new_drive}:"
+    drive = drive.upper()
+    normalized = raw.replace("/", "\\")
+    prefix = ""
+    body = normalized
+    if body.startswith("\\\\?\\"):
+        prefix = "\\\\?\\"
+        body = body[4:]
+    match = re.match(r"^[A-Za-z]:(.*)$", body)
+    if not match:
+        return raw
+    return f"{prefix}{drive}{match.group(1)}"
+
+
+def path_has_reachable_vhdx(path: str | None) -> bool:
+    return bool(path and find_vhdx(path))
+
+
 def apply_config_to_paths(paths: dict, config: dict) -> None:
+    """
+    Apply optional config overrides, but never keep a stale absolute drive letter
+    from another PC (e.g. config says F:\\... while this PC mounted the SSD as H:).
+    Prefer the drive where the launcher exe actually lives.
+    """
+    app_drive = windows_drive_letter(paths.get("app_dir"))
+    auto_install = paths.get("wsl_install_dir")
+
     if config.get("wsl_install_dir"):
-        paths["wsl_install_dir"] = config["wsl_install_dir"]
+        cfg_install = str(config["wsl_install_dir"]).strip()
+        cfg_drive = windows_drive_letter(cfg_install)
+        candidates: list[str] = []
+        if app_drive and cfg_drive and cfg_drive != app_drive:
+            candidates.append(remap_windows_path_drive(cfg_install, app_drive))
+        candidates.append(cfg_install)
+        if auto_install:
+            candidates.append(auto_install)
+
+        chosen = None
+        for candidate in candidates:
+            if path_has_reachable_vhdx(candidate) or (candidate and os.path.isdir(candidate)):
+                # Prefer a candidate that actually has ext4.vhdx.
+                if path_has_reachable_vhdx(candidate):
+                    chosen = candidate
+                    break
+                if chosen is None:
+                    chosen = candidate
+        if chosen:
+            paths["wsl_install_dir"] = chosen
+        # else keep auto-detected install dir
+
     if config.get("tar_path"):
-        paths["tar_path"] = config["tar_path"]
+        cfg_tar = str(config["tar_path"]).strip()
+        cfg_drive = windows_drive_letter(cfg_tar)
+        if app_drive and cfg_drive and cfg_drive != app_drive:
+            remapped = remap_windows_path_drive(cfg_tar, app_drive)
+            if os.path.isfile(remapped):
+                paths["tar_path"] = remapped
+            elif os.path.isfile(cfg_tar):
+                paths["tar_path"] = cfg_tar
+            else:
+                paths["tar_path"] = remapped
+        elif os.path.isfile(cfg_tar) or cfg_tar:
+            paths["tar_path"] = cfg_tar
     elif config.get("tar_filename"):
         base = paths.get("base_dir") or paths["app_dir"]
         paths["tar_path"] = os.path.join(base, config["tar_filename"])
@@ -972,16 +1050,29 @@ class KaliLauncher:
             timeout=timeout,
         )
 
-    def sync_portable_base_path(self) -> bool:
+    def sync_portable_base_path(self, *, force: bool = False) -> bool:
         """
         외장 SSD를 다른 PC에 꽂거나 드라이브 문자가 바뀌면
-        HKCU Lxss BasePath가 옛 경로를 가리켜 배포판이 뜨지 않는다.
-        VHDX는 삭제/unregister 하지 않고 BasePath만 현재 폴더로 맞춘다.
+        HKCU Lxss BasePath가 옛 경로(예: F:)를 가리켜 배포판이 뜨지 않는다.
+        VHDX는 삭제/unregister 하지 않고 BasePath만 현재 실행 드라이브 폴더로 맞춘다.
         """
         install_dir = self.paths["wsl_install_dir"]
         vhdx_path = find_vhdx(install_dir)
         if not vhdx_path or not self.wsl_distro_exists():
             return True
+
+        app_drive = windows_drive_letter(self.paths.get("app_dir") or install_dir)
+        install_drive = windows_drive_letter(install_dir)
+        if app_drive and install_drive and app_drive != install_drive:
+            remapped = remap_windows_path_drive(install_dir, app_drive)
+            self.log(
+                f"설치 경로 드라이브가 실행 위치와 다릅니다: {install_drive} → {app_drive}"
+            )
+            if find_vhdx(remapped) or os.path.isdir(remapped):
+                self.paths["wsl_install_dir"] = remapped
+                install_dir = remapped
+                vhdx_path = find_vhdx(install_dir)
+                force = True
 
         entry = get_wsl_registry_entry(self.config["distro_name"])
         if not entry or not entry.get("guid_key"):
@@ -992,15 +1083,32 @@ class KaliLauncher:
         expected = normalize_wsl_base_path(install_dir)
         registered_vhdx = os.path.join(registered, VHDX_FILENAME) if registered else ""
         registered_ok = bool(registered) and os.path.isfile(registered_vhdx)
+        registered_drive = windows_drive_letter(entry.get("base_path") or registered)
+        expected_drive = windows_drive_letter(install_dir)
 
-        if registered == expected and registered_ok:
+        self.log(
+            f"WSL BasePath 확인: 등록={entry.get('base_path') or '(없음)'} "
+            f"/ 현재={install_dir}"
+        )
+
+        drive_mismatch = bool(
+            registered_drive and expected_drive and registered_drive != expected_drive
+        )
+        if registered == expected and registered_ok and not force and not drive_mismatch:
+            self.log("  → BasePath 일치 (현재 드라이브 사용)")
             return True
 
-        self.log("WSL 등록 경로가 현재 외장 SSD 위치와 다릅니다.")
+        self.log("WSL 등록 경로를 현재 외장 SSD 위치로 맞춥니다.")
         self.log(f"  등록됨: {entry.get('base_path') or '(없음)'}")
         self.log(f"  현재:   {install_dir}")
+        if drive_mismatch:
+            self.log(
+                f"  → 드라이브 문자 불일치: 등록 {registered_drive} / 현재 {expected_drive}"
+            )
         if registered and not registered_ok:
             self.log("  → 등록된 경로에 ext4.vhdx가 없습니다 (드라이브 문자/PC 변경 가능).")
+        if force:
+            self.log("  → 강제 재기록 (MountDisk 실패 후 또는 경로 재탐지)")
         self.log("  → VHDX는 유지한 채 BasePath만 현재 위치로 수정합니다.")
 
         self._run(["wsl", "--shutdown"], timeout=90.0)
@@ -1012,7 +1120,10 @@ class KaliLauncher:
             self.log("  → 관리자 권한 없이 실패했다면, 동일 Windows 계정인지 확인하세요.")
             return False
 
-        self.log("  → BasePath 수정 완료 (ext4.vhdx 보존)")
+        # Verify what is now stored.
+        verify = get_wsl_registry_entry(self.config["distro_name"])
+        verify_path = (verify or {}).get("base_path") if verify else None
+        self.log(f"  → BasePath 수정 완료 (ext4.vhdx 보존): {verify_path or install_dir}")
         return True
 
     def probe_wsl_health(self) -> bool:
@@ -1135,6 +1246,17 @@ class KaliLauncher:
                         return True
                     last_detail = (wake2.stderr or wake2.stdout or last_detail).strip()
                     self.log(f"  → 준비 후 재시도 실패: {last_detail or '(메시지 없음)'}")
+
+                # Stale BasePath (other PC drive letter) often surfaces as MountDisk errors.
+                self.log("  → 현재 실행 드라이브로 WSL BasePath 강제 재동기화")
+                if self.sync_portable_base_path(force=True):
+                    wake3 = self._wake_wsl_true(timeout=120.0)
+                    wake3_text = f"{wake3.stdout}\n{wake3.stderr}"
+                    if wake3.returncode == 0 and not self._wsl_output_unhealthy(wake3_text):
+                        self.log("  → BasePath 강제 동기화 후 WSL 재시작 완료")
+                        return True
+                    last_detail = (wake3.stderr or wake3.stdout or last_detail).strip()
+                    self.log(f"  → BasePath 강제 동기화 후 실패: {last_detail or '(메시지 없음)'}")
 
                 self.log("  → VHDX 손상 마운트 — LxssManager 반복 재시도를 중단합니다.")
                 break
@@ -2102,6 +2224,9 @@ class KaliLauncher:
             self.log(f"{APP_NAME} 시작")
             self.log(f"앱 경로: {self.paths['app_dir']}")
             self.log(f"WSL 설치 경로: {self.paths['wsl_install_dir']}")
+            app_drive = windows_drive_letter(self.paths["app_dir"])
+            if app_drive:
+                self.log(f"실행 드라이브: {app_drive} (고정 드라이브 문자 없음 · 현재 PC 기준)")
             vhdx = find_vhdx(self.paths["wsl_install_dir"])
             if vhdx:
                 self.log(f"VHDX: {vhdx} (보존)")
@@ -2109,6 +2234,11 @@ class KaliLauncher:
             self.log("알림: ext4.vhdx 를 삭제/교체하거나 새 Kali를 받지 않습니다. 외장 SSD의 그 환경을 그대로 씁니다.")
             self.log("알림: 시작 중 탐색기에서 \\\\wsl$ / Linux 아이콘 / ext4.vhdx 를 열지 마세요.")
             self.log("알림: 외장 SSD의 VHDX는 첫 기동이 느릴 수 있습니다. 명령이 길면 HCS 대기일 수 있습니다.")
+
+            # Always align WSL BasePath to this PC's drive letter before health checks.
+            if self.wsl_distro_exists() and not self.sync_portable_base_path():
+                self.log("오류: WSL BasePath를 현재 드라이브에 맞추지 못했습니다.")
+                return
 
             if not self.ensure_wsl_platform():
                 return

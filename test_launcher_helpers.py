@@ -117,5 +117,58 @@ class VhdxCorruptMountTests(unittest.TestCase):
         self.assertEqual(launcher._current_ssd_drive_hint(), "H:")
 
 
+class DriveRemapTests(unittest.TestCase):
+    def test_windows_drive_letter(self) -> None:
+        from kali_launcher import windows_drive_letter
+
+        self.assertEqual(windows_drive_letter(r"H:\0.Kali\kali-portable"), "H:")
+        self.assertEqual(windows_drive_letter(r"\\?\F:\0.Kali\kali-portable"), "F:")
+        self.assertEqual(windows_drive_letter(r"e:/tmp"), "E:")
+
+    def test_remap_drive(self) -> None:
+        from kali_launcher import remap_windows_path_drive
+
+        self.assertEqual(
+            remap_windows_path_drive(r"F:\0.Kali\kali-portable", "H:"),
+            r"H:\0.Kali\kali-portable",
+        )
+        self.assertEqual(
+            remap_windows_path_drive(r"\\?\F:\0.Kali\kali-portable", "H:"),
+            r"\\?\H:\0.Kali\kali-portable",
+        )
+
+    def test_config_path_remaps_stale_drive(self) -> None:
+        from unittest.mock import patch
+
+        from kali_launcher import apply_config_to_paths
+
+        paths = {
+            "app_dir": r"H:\0.Kali",
+            "base_dir": r"H:\0.Kali",
+            "wsl_install_dir": r"H:\0.Kali\kali-portable",
+            "tar_path": r"H:\0.Kali\kali-final.tar",
+        }
+
+        def fake_vhdx(install_dir: str):
+            if install_dir.upper().startswith("H:"):
+                return install_dir.rstrip("\\") + r"\ext4.vhdx"
+            return None
+
+        with (
+            patch("kali_launcher.find_vhdx", side_effect=fake_vhdx),
+            patch("kali_launcher.os.path.isdir", return_value=True),
+            patch("kali_launcher.os.path.isfile", return_value=True),
+        ):
+            apply_config_to_paths(
+                paths,
+                {
+                    "wsl_install_dir": r"F:\0.Kali\kali-portable",
+                    "tar_path": r"F:\0.Kali\kali-final.tar",
+                },
+            )
+        self.assertEqual(paths["wsl_install_dir"], r"H:\0.Kali\kali-portable")
+        self.assertEqual(paths["tar_path"], r"H:\0.Kali\kali-final.tar")
+
+
 if __name__ == "__main__":
     unittest.main()
