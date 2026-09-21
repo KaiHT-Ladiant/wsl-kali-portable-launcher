@@ -1,0 +1,47 @@
+name: Build EXE
+
+on:
+  push:
+    branches:
+      - main
+      - "kai_ht/**"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+
+      - name: Build exe
+        run: |
+          python -m PyInstaller --onefile --windowed --name KaliLauncher `
+            --icon=kali_icon.ico `
+            --add-data "kali_icon.ico;." `
+            --add-data "kali_icon.png;." `
+            --version-file=version_info.txt `
+            --clean kali_launcher.py
+          copy kali_icon.ico dist\
+          copy kali_icon.png dist\
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KaliLauncher-exe
+          path: |
+            dist/KaliLauncher.exe
+            dist/kali_icon.ico
+            dist/kali_icon.png
+          if-no-files-found: error
