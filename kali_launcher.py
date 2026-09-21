@@ -29,7 +29,7 @@ from tkinter import messagebox, scrolledtext, ttk
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Kali Linux Portable"
-APP_VERSION = "1.2.15"
+APP_VERSION = "1.2.16"
 LXSS_REG_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss"
 DEFAULT_DISTRO = "kali-linux"
 DEFAULT_USER = "kali"
@@ -956,80 +956,6 @@ class KaliLauncher:
         self.log("  → VHDX Windows 읽기 확인 OK")
         return True
 
-    def _helper_wsl_distros(self) -> list[str]:
-        mine = (self.config.get("distro_name") or "").lower()
-        return [name for name in list_wsl_distros() if name.lower() != mine]
-
-    def repair_vhdx_with_e2fsck(self) -> bool:
-        """
-        Attach the portable VHDX as a bare disk and run e2fsck from another
-        WSL distro. Never deletes/unregisters kali-linux or its VHDX.
-        """
-        vhdx = find_vhdx(self.paths["wsl_install_dir"])
-        if not vhdx:
-            return False
-
-        helpers = self._helper_wsl_distros()
-        if not helpers:
-            self.log("  → e2fsck용 다른 WSL 배포판이 없어 파일시스템 점검은 건너뜁니다.")
-            self.log("  → (원하시면 Ubuntu 등 보조 배포판을 설치한 뒤 다시 시작하세요)")
-            return False
-
-        helper = helpers[0]
-        self.log(f"  → VHDX bare mount 후 e2fsck 시도 (helper: {helper}, VHDX 삭제 없음)")
-        self._run(["wsl", "--shutdown"], timeout=90.0)
-        time.sleep(3)
-
-        mount = self._run(
-            ["wsl", "--mount", vhdx, "--vhd", "--bare"],
-            timeout=120.0,
-        )
-        mount_text = f"{mount.stdout}\n{mount.stderr}"
-        if mount.returncode != 0 or self._wsl_output_unhealthy(mount_text):
-            detail = (mount.stderr or mount.stdout or "").strip()
-            self.log(f"  → wsl --mount --bare 실패: {detail[:400] or '(출력 없음)'}")
-            self._run(["wsl", "--unmount", vhdx], timeout=60.0)
-            return False
-
-        # Prefer non-root disks; WSL VHDX is usually /dev/sdX or /dev/sdX1.
-        script = (
-            "set +e; "
-            "found=''; "
-            "for dev in /dev/sd[b-z] /dev/sd[b-z][0-9]* /dev/sd[a-z] /dev/sd[a-z][0-9]*; do "
-            "  [ -b \"$dev\" ] || continue; "
-            "  root_src=$(findmnt -n -o SOURCE / 2>/dev/null || true); "
-            "  case \"$root_src\" in \"$dev\"*) continue ;; esac; "
-            "  typ=$(blkid -o value -s TYPE \"$dev\" 2>/dev/null || true); "
-            "  case \"$typ\" in ext2|ext3|ext4) found=\"$dev\"; break ;; esac; "
-            "done; "
-            "if [ -z \"$found\" ]; then echo NO_EXT_DEVICE; exit 2; fi; "
-            "echo REPAIR_TARGET=$found; "
-            "e2fsck -fy \"$found\"; rc=$?; "
-            "echo E2FSCK_EXIT=$rc; "
-            "exit 0"
-        )
-        repair = self._run(
-            ["wsl", "-d", helper, "-u", "root", "--", "bash", "-lc", script],
-            timeout=900.0,
-        )
-        repair_out = ((repair.stdout or "") + "\n" + (repair.stderr or "")).strip()
-        if repair_out:
-            self.log(f"  → e2fsck 출력:\n{repair_out[:800]}")
-
-        self._run(["wsl", "--unmount", vhdx], timeout=60.0)
-        self._run(["wsl", "--shutdown"], timeout=90.0)
-        time.sleep(2)
-
-        if "NO_EXT_DEVICE" in repair_out:
-            self.log("  → bare mount된 ext 파티션을 찾지 못했습니다.")
-            return False
-        if "E2FSCK_EXIT=" not in repair_out and repair.returncode != 0:
-            self.log("  → e2fsck 실행 실패")
-            return False
-
-        self.log("  → e2fsck 완료 (VHDX 보존)")
-        return True
-
     def _wake_wsl_true(self, *, timeout: float = 90.0) -> RunResult:
         return self._run(
             [
@@ -1152,7 +1078,7 @@ class KaliLauncher:
             self.log("힌트: MountDisk/0x80070570 — WSL이 ext4.vhdx를 붙이지 못했습니다.")
             self.log("  · ext4.vhdx는 삭제하지 마세요. 이 런처도 삭제/교체하지 않습니다.")
             self.log("  · NTFS 압축·읽기전용이면 attrib/compact 해제 후 다시 시도합니다.")
-            self.log("  · 이전 PC에서 「정지」 없이 SSD를 뽑았다면 e2fsck가 필요할 수 있습니다.")
+            self.log("  · 이전 PC에서 「정지」 없이 SSD를 뽑지 마세요. 실패 시 PC 재부팅 후 한 번만 재시도하세요.")
             self.log("  · 탐색기에서 \\\\wsl$ / ext4.vhdx 를 연 채로 두지 마세요.")
             self.log(
                 f"  · 최후 수단: VHDX 백업 후 {drive}\\ 의 kali-final.tar 로 "
@@ -1196,7 +1122,7 @@ class KaliLauncher:
                 # Shutdown/LxssManager loops cannot fix ERROR_FILE_CORRUPT mounts.
                 self.log(
                     "  → VHDX MountDisk 손상/읽기 불가(0x80070570) 감지 "
-                    "— 삭제 없이 Windows 준비·복구로 전환"
+                    "— 삭제 없이 Windows 쪽 VHDX 준비로 전환"
                 )
                 prepared = self.prepare_vhdx_file_windows()
                 if prepared:
@@ -1209,16 +1135,6 @@ class KaliLauncher:
                         return True
                     last_detail = (wake2.stderr or wake2.stdout or last_detail).strip()
                     self.log(f"  → 준비 후 재시도 실패: {last_detail or '(메시지 없음)'}")
-
-                if self._is_vhdx_corrupt_mount(last_detail) or not prepared:
-                    if self.repair_vhdx_with_e2fsck():
-                        wake3 = self._wake_wsl_true(timeout=120.0)
-                        wake3_text = f"{wake3.stdout}\n{wake3.stderr}"
-                        if wake3.returncode == 0 and not self._wsl_output_unhealthy(wake3_text):
-                            self.log("  → e2fsck 후 WSL 재시작 완료")
-                            return True
-                        last_detail = (wake3.stderr or wake3.stdout or last_detail).strip()
-                        self.log(f"  → e2fsck 후 재시도 실패: {last_detail or '(메시지 없음)'}")
 
                 self.log("  → VHDX 손상 마운트 — LxssManager 반복 재시도를 중단합니다.")
                 break
@@ -1251,7 +1167,7 @@ class KaliLauncher:
             return True
         self.log("오류: WSL이 정상 상태로 복구되지 않았습니다.")
         self.log("  시작 버튼을 반복하지 말고, SSD 연결 확인 후 PC를 재부팅하세요.")
-        self.log("  MountDisk/0x80070570 이면 NTFS 압축 해제·e2fsck 후 다시 시도하세요 (VHDX 삭제 금지).")
+        self.log("  MountDisk/0x80070570 이면 NTFS 압축 해제 후 다시 시도하세요 (VHDX 삭제 금지).")
         self.log("  계속 HCS_E_CONNECTION_TIMEOUT이면 ext4.vhdx 점검 또는 tar 재등록이 필요할 수 있습니다.")
         return False
 
