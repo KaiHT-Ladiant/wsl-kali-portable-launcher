@@ -8,6 +8,8 @@ Thank you to everyone who helps improve this project.
 |------|--------|------|
 | Kai_HT | [@KaiHT-Ladiant](https://github.com/KaiHT-Ladiant) | Author and maintainer |
 
+GitHub [Releases](https://github.com/KaiHT-Ladiant/wsl-kali-portable-launcher/releases) and the public README credit **Kai_HT** as the project maintainer.
+
 ## Contributing
 
 Contributions are welcome. To be listed here:

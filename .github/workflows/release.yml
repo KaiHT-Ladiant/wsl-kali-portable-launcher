@@ -32,6 +32,7 @@ jobs:
             --version-file=version_info.txt `
             --clean kali_launcher.py
           copy kali_icon.ico dist\
+          copy kali_icon.png dist\
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -39,4 +40,12 @@ jobs:
           files: |
             dist/KaliLauncher.exe
             dist/kali_icon.ico
+            dist/kali_icon.png
           generate_release_notes: true
+          body: |
+            Maintained by **Kai_HT** ([@KaiHT-Ladiant](https://github.com/KaiHT-Ladiant)).
+
+            - [README](https://github.com/KaiHT-Ladiant/wsl-kali-portable-launcher#readme)
+            - [Contributors](https://github.com/KaiHT-Ladiant/wsl-kali-portable-launcher/blob/main/CONTRIBUTORS.md)
+
+            Place `KaliLauncher.exe` next to your portable `kali-portable\ext4.vhdx` (or under `0.Kali`).
