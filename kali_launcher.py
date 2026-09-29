@@ -29,7 +29,7 @@ from tkinter import messagebox, scrolledtext, ttk
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Kali Linux Portable"
-APP_VERSION = "1.2.20"
+APP_VERSION = "1.2.21"
 LXSS_REG_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss"
 DEFAULT_DISTRO = "kali-linux"
 DEFAULT_USER = "kali"
@@ -707,6 +707,95 @@ def run_command(
     )
 
 
+def run_command_with_heartbeat(
+    cmd: list[str],
+    *,
+    log_fn,
+    heartbeat_sec: float = 30.0,
+    cwd: str | None = None,
+    progress_path: str | None = None,
+) -> RunResult:
+    """
+    Long-running commands (wsl --import on external SSD) with periodic log lines.
+    Never kills the process for being slow — only reports progress.
+    """
+    workdir = cwd or safe_windows_cwd()
+    log_fn(f"> {' '.join(cmd)}")
+    log_fn(
+        "  → 진행 중… 외장 SSD면 수 분~수십 분 걸릴 수 있습니다. "
+        "창을 닫지 마세요."
+    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=workdir,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except FileNotFoundError:
+        return RunResult(returncode=127, stdout="", stderr="command not found")
+
+    started = time.time()
+    last_beat = started
+    last_size = -1
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+
+    def _drain(stream, bucket: list[bytes]) -> None:
+        if stream is None:
+            return
+        try:
+            data = stream.read()
+        except Exception:
+            return
+        if data:
+            bucket.append(data)
+
+    # Read pipes in background so the child cannot block on full buffers.
+    out_thread = threading.Thread(
+        target=_drain, args=(proc.stdout, stdout_chunks), daemon=True
+    )
+    err_thread = threading.Thread(
+        target=_drain, args=(proc.stderr, stderr_chunks), daemon=True
+    )
+    out_thread.start()
+    err_thread.start()
+
+    while proc.poll() is None:
+        time.sleep(1.0)
+        now = time.time()
+        if now - last_beat < heartbeat_sec:
+            continue
+        last_beat = now
+        elapsed_min = int((now - started) / 60)
+        elapsed_sec = int((now - started) % 60)
+        msg = f"  → 아직 진행 중… ({elapsed_min}분 {elapsed_sec:02d}초)"
+        if progress_path and os.path.isfile(progress_path):
+            try:
+                size = os.path.getsize(progress_path)
+            except OSError:
+                size = -1
+            if size >= 0:
+                mb = max(1, size // (1024 * 1024))
+                delta = ""
+                if last_size >= 0 and size >= last_size:
+                    grew = (size - last_size) // (1024 * 1024)
+                    delta = f", +{grew} MB"
+                last_size = size
+                msg += f" · 새 VHDX ≈ {mb} MB{delta}"
+        log_fn(msg)
+
+    out_thread.join(timeout=5)
+    err_thread.join(timeout=5)
+    returncode = proc.returncode if proc.returncode is not None else 1
+    stdout = decode_subprocess_output(b"".join(stdout_chunks))
+    stderr = decode_subprocess_output(b"".join(stderr_chunks))
+    elapsed = int(time.time() - started)
+    log_fn(f"  → 명령 종료 (exit {returncode}, {elapsed // 60}분 {elapsed % 60:02d}초)")
+    return RunResult(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
 def start_detached(cmd: list[str], *, cwd: str | None = None) -> None:
     """Fire-and-forget. Do not wait — kex --start may never exit."""
     flags = subprocess.CREATE_NO_WINDOW | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -790,6 +879,20 @@ class KaliLauncher:
     def _run(self, cmd: list[str], *, check: bool = False, timeout: float | None = 120.0) -> RunResult:
         self.log(f"> {' '.join(cmd)}")
         return run_command(cmd, check=check, timeout=timeout)
+
+    def _run_long(
+        self,
+        cmd: list[str],
+        *,
+        progress_path: str | None = None,
+        heartbeat_sec: float = 30.0,
+    ) -> RunResult:
+        return run_command_with_heartbeat(
+            cmd,
+            log_fn=self.log,
+            heartbeat_sec=heartbeat_sec,
+            progress_path=progress_path,
+        )
 
     def wsl_distro_exists(self) -> bool:
         distro = self.config["distro_name"].lower()
@@ -906,8 +1009,10 @@ class KaliLauncher:
             self.log(f"오류: 등록할 VHDX/tar를 찾을 수 없습니다.\n  vhdx: {install_dir}\\{VHDX_FILENAME}\n  tar: {tar_path}")
             return False
 
+        # First-time import from tar (no existing VHDX).
         self.log("처음 실행 — Kali Linux WSL 가져오기 중... (시간이 걸릴 수 있습니다)")
-        result = self._run(
+        self.log("  → 외장 SSD면 수 분~수십 분 걸릴 수 있습니다. 창을 닫지 마세요.")
+        result = self._run_long(
             [
                 "wsl",
                 "--import",
@@ -917,7 +1022,8 @@ class KaliLauncher:
                 "--version",
                 "2",
             ],
-            timeout=None,
+            progress_path=os.path.join(install_dir, VHDX_FILENAME),
+            heartbeat_sec=30.0,
         )
         if result.returncode != 0:
             message = (result.stderr or result.stdout or "알 수 없는 오류").strip()
@@ -1505,8 +1611,17 @@ class KaliLauncher:
             if bak_path and not os.path.isfile(bak_path):
                 self.log("  → 경고: 백업 VHDX 가 보이지 않습니다. 탐색기에서 폴더를 확인하세요.")
 
+        # Fresh import creates a new ext4.vhdx beside the .bak file.
+        new_vhdx = os.path.join(install_dir, VHDX_FILENAME)
+        try:
+            tar_mb = max(1, os.path.getsize(tar_path) // (1024 * 1024))
+        except OSError:
+            tar_mb = 0
         self.log(f"  → tar 재등록 시작 (새 ext4.vhdx 생성, 백업 유지):\n    {tar_path}")
-        result = self._run(
+        if tar_mb:
+            self.log(f"  → tar 크기 ≈ {tar_mb} MB — 외장 SSD면 특히 오래 걸립니다.")
+        self.log("  → 중요: 이 단계에서 창/PC를 끄지 마세요. 로그에 30초마다 진행이 표시됩니다.")
+        result = self._run_long(
             [
                 "wsl",
                 "--import",
@@ -1516,12 +1631,21 @@ class KaliLauncher:
                 "--version",
                 "2",
             ],
-            timeout=None,
+            progress_path=new_vhdx,
+            heartbeat_sec=30.0,
         )
         if result.returncode != 0 and not self.wsl_distro_exists():
             message = (result.stderr or result.stdout or "").strip()
             self.log(f"  → tar 가져오기 실패: {message[:500] or '(출력 없음)'}")
+            if os.path.isfile(new_vhdx):
+                self.log(
+                    "  → 불완전할 수 있는 새 ext4.vhdx 가 있습니다. "
+                    " bak 는 그대로 두었으니, 필요하면 새 파일을 지우고 「손상 복구(tar)」를 다시 실행하세요."
+                )
             return False
+
+        if not os.path.isfile(new_vhdx):
+            self.log("  → 경고: import 후에도 새 ext4.vhdx 가 없습니다.")
 
         self.sync_portable_base_path(force=True)
         wake = self._wake_wsl_true(timeout=180.0)
