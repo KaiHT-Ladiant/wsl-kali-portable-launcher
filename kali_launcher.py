@@ -29,7 +29,7 @@ from tkinter import messagebox, scrolledtext, ttk
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Kali Linux Portable"
-APP_VERSION = "1.2.21"
+APP_VERSION = "1.2.22"
 LXSS_REG_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss"
 DEFAULT_DISTRO = "kali-linux"
 DEFAULT_USER = "kali"
@@ -875,6 +875,8 @@ class KaliLauncher:
         self.config = load_config(self.paths)
         apply_config_to_paths(self.paths, self.config)
         self._busy = False
+        # Set when this session imported/re-registered from tar (not a VHDX reuse).
+        self._fresh_tar_import = False
 
     def _run(self, cmd: list[str], *, check: bool = False, timeout: float | None = 120.0) -> RunResult:
         self.log(f"> {' '.join(cmd)}")
@@ -970,7 +972,10 @@ class KaliLauncher:
         Never calls wsl --unregister. Never deletes *.vhdx.
         """
         if self.wsl_distro_exists():
-            self.log("WSL 배포판이 이미 등록되어 있습니다.")
+            vhdx_now = find_vhdx(self.paths["wsl_install_dir"])
+            self.log("WSL 배포판이 이미 등록되어 있습니다. (tar 재가져오기 없음)")
+            if vhdx_now:
+                self.log(f"  → 기존 VHDX 사용: {vhdx_now}")
             return True
 
         install_dir = self.paths["wsl_install_dir"]
@@ -998,7 +1003,7 @@ class KaliLauncher:
                 timeout=300.0,
             )
             if result.returncode == 0 or self.wsl_distro_exists():
-                self.log("기존 VHDX 등록 완료 (파일 유지).")
+                self.log("기존 VHDX 등록 완료 (파일 유지 · tar 재가져오기 없음).")
                 return True
             message = (result.stderr or result.stdout or "").strip()
             self.log(f"import-in-place 실패:\n{message}")
@@ -1010,7 +1015,7 @@ class KaliLauncher:
             return False
 
         # First-time import from tar (no existing VHDX).
-        self.log("처음 실행 — Kali Linux WSL 가져오기 중... (시간이 걸릴 수 있습니다)")
+        self.log("VHDX 없음 — kali-final.tar 로 WSL 가져오기 (한 번만, 새 Kali 웹 다운로드 아님)")
         self.log("  → 외장 SSD면 수 분~수십 분 걸릴 수 있습니다. 창을 닫지 마세요.")
         result = self._run_long(
             [
@@ -1033,7 +1038,8 @@ class KaliLauncher:
             self.log(f"WSL 가져오기 실패:\n{message}")
             return False
 
-        self.log("WSL 가져오기 완료.")
+        self._fresh_tar_import = True
+        self.log("WSL 가져오기 완료. (다음 「시작」에서는 tar를 다시 가져오지 않습니다)")
         return True
 
     def _wsl_output_unhealthy(self, text: str) -> bool:
@@ -1651,18 +1657,60 @@ class KaliLauncher:
         wake = self._wake_wsl_true(timeout=180.0)
         wake_text = f"{wake.stdout}\n{wake.stderr}"
         if wake.returncode == 0 and not self._wsl_output_unhealthy(wake_text):
+            self._fresh_tar_import = True
             self.log("  → tar 재등록 후 WSL 기동 OK")
             if bak_path:
                 self.log(f"  → 이전 VHDX 백업 위치: {bak_path}")
             self.log(
-                f"  → 참고: tar 기본 사용자가 다를 수 있습니다. "
-                f"설정 wsl_user={self.config.get('wsl_user')} 를 확인하세요."
+                "  → 다음: Win-KeX 패키지 확인 후 「Kali Linux 시작」 "
+                "(tar 재가져오기 없음 · 새 Kali 웹 다운로드 없음)"
             )
             return True
 
         detail = (wake.stderr or wake.stdout or "").strip()
         self.log(f"  → tar 재등록 후 기동 실패: {detail[:500] or '(메시지 없음)'}")
         return False
+
+    def resolve_wsl_user(self) -> str:
+        """
+        After tar import the configured user (e.g. Kai_HT) may not exist yet.
+        Prefer config user, then kali, then root — never fail the whole start silently.
+        """
+        wanted = (self.config.get("wsl_user") or "").strip() or DEFAULT_USER
+        candidates: list[str] = []
+        for name in (wanted, "kali", "root"):
+            if name and name not in candidates:
+                candidates.append(name)
+
+        for name in candidates:
+            probe = self._run(
+                [
+                    "wsl",
+                    "--cd",
+                    "/",
+                    "-d",
+                    self.config["distro_name"],
+                    "-u",
+                    "root",
+                    "--",
+                    "bash",
+                    "-lc",
+                    f"id -u {shlex.quote(name)} >/dev/null 2>&1 && echo USER_OK || echo USER_MISSING",
+                ],
+                timeout=30.0,
+            )
+            if "USER_OK" in (probe.stdout or ""):
+                if name != wanted:
+                    self.log(
+                        f"  → WSL 사용자 '{wanted}' 없음 — '{name}' 로 진행 "
+                        f"(config wsl_user 는 나중에 맞추면 됩니다)"
+                    )
+                    self.config["wsl_user"] = name
+                return name
+
+        self.log("  → 사용 가능한 WSL 사용자를 찾지 못해 root 로 진행합니다.")
+        self.config["wsl_user"] = "root"
+        return "root"
 
     def ensure_wsl_healthy(self) -> bool:
         if not self.wsl_distro_exists():
@@ -1710,10 +1758,12 @@ class KaliLauncher:
     def ensure_winkex_installed(self) -> bool:
         """
         Verify Win-KeX files inside the existing portable VHDX.
-        Never deletes/replaces ext4.vhdx. Never downloads a new Kali distro.
-        apt install is opt-in only (auto_install_winkex=true).
+        Never deletes/replaces ext4.vhdx. Never downloads a new Kali distro image.
+        After a fresh tar import, missing kali-win-kex is installed via apt inside
+        the same VHDX (package only — not a new Kali download).
         """
-        self.log("Win-KeX 구성 확인 (기존 VHDX 유지 · 새 Kali 다운로드 없음)")
+        self.log("Win-KeX 구성 확인 (기존 VHDX 유지 · 새 Kali 이미지 다운로드 없음)")
+        self.resolve_wsl_user()
         check = (
             "echo '--- paths ---'; "
             "ls -la /usr/bin/kex /usr/lib/win-kex /usr/lib/win-kex/xstartup "
@@ -1732,21 +1782,22 @@ class KaliLauncher:
             "if [ -z \"$missing\" ]; then echo WINKEX_OK; "
             "else echo WINKEX_MISSING:$missing; fi"
         )
+        # Check as root so a missing login user cannot hide packages that exist.
         result = self._run(
             [
                 "wsl",
                 "--cd",
-                "~",
+                "/",
                 "-d",
                 self.config["distro_name"],
                 "-u",
-                self.config["wsl_user"],
+                "root",
                 "--",
                 "bash",
                 "-lc",
                 check,
             ],
-            timeout=45.0,
+            timeout=60.0,
         )
         out = (result.stdout or "").strip()
         if out:
@@ -1756,20 +1807,48 @@ class KaliLauncher:
             return True
 
         self.log("  → Win-KeX 파일이 이 VHDX 안에서 확인되지 않습니다.")
-        self.log("  → 새 Kali를 받지 않습니다. ext4.vhdx도 삭제/교체하지 않습니다.")
-        if not self.config.get("auto_install_winkex", False):
-            self.log("힌트: 노트북과 같은 VHDX면 이 PC의 마운트/캐시 문제일 수 있습니다.")
-            self.log("  wsl --shutdown 후 다시 시작하세요.")
-            self.log("  패키지만 깨졌을 때만 VHDX 안에서: sudo apt install -y kali-win-kex")
-            self.log("  자동 apt를 쓰려면 config에 \"auto_install_winkex\": true")
-            return False
+        has_bak = False
+        try:
+            for name in os.listdir(self.paths["wsl_install_dir"]):
+                if name.startswith("ext4.vhdx.bak-"):
+                    has_bak = True
+                    break
+        except OSError:
+            pass
 
-        self.log("  → auto_install_winkex=true — 같은 VHDX 안에 패키지만 설치")
-        install = self._run(
+        allow_apt = bool(
+            self.config.get("auto_install_winkex", False)
+            or self._fresh_tar_import
+            or has_bak
+        )
+        if not allow_apt:
+            ask = messagebox.askyesno(
+                APP_NAME,
+                "이 VHDX 안에 Win-KeX(kex)가 없습니다.\n\n"
+                "같은 VHDX 안에 kali-win-kex 패키지만 설치할까요?\n"
+                "(새 Kali 다운로드 아님 · ext4.vhdx 삭제/교체 아님 · tar 재가져오기 아님)\n\n"
+                "「아니요」면 기동을 중단합니다.",
+            )
+            if not ask:
+                self.log("  → 사용자가 Win-KeX 패키지 설치를 취소했습니다.")
+                self.log("  → 「시작」을 다시 눌러도 tar 재가져오기는 하지 않습니다.")
+                return False
+            allow_apt = True
+
+        if self._fresh_tar_import or has_bak:
+            self.log(
+                "  → tar 기반 환경 — 같은 VHDX 안에 kali-win-kex 패키지만 설치 "
+                "(새 Kali 다운로드/VHDX 교체/tar 재가져오기 아님)"
+            )
+        else:
+            self.log("  → 같은 VHDX 안에 kali-win-kex 패키지만 설치")
+
+        self.log("  → apt 설치는 수 분 걸릴 수 있습니다. 창을 닫지 마세요.")
+        install = self._run_long(
             [
                 "wsl",
                 "--cd",
-                "~",
+                "/",
                 "-d",
                 self.config["distro_name"],
                 "-u",
@@ -1778,15 +1857,40 @@ class KaliLauncher:
                 "bash",
                 "-lc",
                 "export DEBIAN_FRONTEND=noninteractive; "
-                "apt-get update -y && apt-get install -y kali-win-kex && echo INSTALL_OK || echo INSTALL_FAIL",
+                "apt-get update -y && apt-get install -y kali-win-kex "
+                "&& echo INSTALL_OK || echo INSTALL_FAIL",
             ],
-            timeout=900.0,
+            heartbeat_sec=30.0,
         )
         install_out = f"{install.stdout}\n{install.stderr}".strip()
         if "INSTALL_OK" in install_out:
-            self.log("  → kali-win-kex 설치 완료 (VHDX 교체 없음)")
-            return True
-        self.log("오류: Win-KeX 복구 실패. VHDX는 그대로 두었습니다.")
+            self.log("  → kali-win-kex 설치 완료 (VHDX 교체 없음 · tar 재가져오기 없음)")
+            # Re-check quickly
+            verify = self._run(
+                [
+                    "wsl",
+                    "--cd",
+                    "/",
+                    "-d",
+                    self.config["distro_name"],
+                    "-u",
+                    "root",
+                    "--",
+                    "bash",
+                    "-lc",
+                    "test -x /usr/bin/kex && test -f /usr/lib/win-kex/xstartup "
+                    "&& echo WINKEX_OK || echo WINKEX_STILL_MISSING",
+                ],
+                timeout=45.0,
+            )
+            if "WINKEX_OK" in (verify.stdout or ""):
+                return True
+            self.log("  → 설치는 끝났으나 파일 확인 실패 — 로그를 확인하세요.")
+            if verify.stdout:
+                self.log(verify.stdout[-400:])
+            return False
+
+        self.log("오류: Win-KeX 패키지 설치 실패. VHDX/tar 는 그대로 두었습니다.")
         if install_out:
             self.log(f"설치 출력:\n{install_out[-800:]}")
         return False
@@ -2654,6 +2758,10 @@ class KaliLauncher:
             if not self.import_wsl_if_needed():
                 return
 
+            # After tar import, configured user may be missing — resolve before KeX.
+            if self.wsl_distro_exists():
+                self.resolve_wsl_user()
+
             if not self.ensure_winkex_installed():
                 return
 
@@ -2669,6 +2777,11 @@ class KaliLauncher:
                 return
 
             self.log("완료되었습니다. Kali 데스크톱이 곧 표시됩니다.")
+            if self._fresh_tar_import:
+                self.log(
+                    "참고: 이번 세션은 tar로 가져온 환경입니다. "
+                    "이후 「시작」은 VHDX만 사용하며 tar를 다시 가져오지 않습니다."
+                )
         finally:
             self._busy = False
 
