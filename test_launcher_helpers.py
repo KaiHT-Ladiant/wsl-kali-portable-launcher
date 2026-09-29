@@ -146,6 +146,13 @@ class DriveRemapTests(unittest.TestCase):
             r"\\?\H:\0.Kali\kali-portable",
         )
 
+    def test_vhdx_backup_name(self) -> None:
+        from kali_launcher import vhdx_backup_name
+
+        path = vhdx_backup_name(r"H:\0.Kali\kali-portable", stamp="20260929-010203")
+        self.assertEqual(path, r"H:\0.Kali\kali-portable\ext4.vhdx.bak-20260929-010203")
+        self.assertFalse(path.endswith("ext4.vhdx"))
+
     def test_config_path_remaps_stale_drive(self) -> None:
         from unittest.mock import patch
 

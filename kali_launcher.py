@@ -29,7 +29,7 @@ from tkinter import messagebox, scrolledtext, ttk
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Kali Linux Portable"
-APP_VERSION = "1.2.18"
+APP_VERSION = "1.2.19"
 LXSS_REG_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss"
 DEFAULT_DISTRO = "kali-linux"
 DEFAULT_USER = "kali"
@@ -289,6 +289,8 @@ def load_config(paths: dict) -> dict:
         "recover_wsl_on_start": True,
         "shutdown_wsl_on_stop": True,
         "auto_install_winkex": False,
+        # Prompt to rename-backup broken ext4.vhdx and re-import from kali-final.tar
+        "offer_tar_reregister_on_corrupt": True,
         "vcxsrv_extra_args": [":0", "-multiwindow", "-clipboard", "-primary", "-wgl", "-dpi", "auto"],
     }
     cfg_path = paths["config_path"]
@@ -755,6 +757,18 @@ def find_vhdx(install_dir: str) -> str | None:
     if os.path.isfile(path):
         return path
     return None
+
+
+def vhdx_backup_name(install_dir: str, stamp: str | None = None) -> str:
+    """Rename target for a broken portable VHDX (never overwrite/delete original bytes)."""
+    tag = stamp or time.strftime("%Y%m%d-%H%M%S")
+    name = f"ext4.vhdx.bak-{tag}"
+    base = (install_dir or "").rstrip("\\/")
+    # Keep Windows-style separators when the install dir is a Windows path
+    # (unit tests may run on Linux).
+    if windows_drive_letter(base) or "\\" in base:
+        return f"{base}\\{name}"
+    return os.path.join(base, name)
 
 
 # ---------------------------------------------------------------------------
@@ -1275,8 +1289,8 @@ class KaliLauncher:
             self.log("  · 가능하면 SSD를 USB 3.x 직접 포트에 연결 (허브 금지)")
             self.log("  · 관리자 PowerShell: Repair-VHD -Path '...\\ext4.vhdx' -Mode Scan")
             self.log(
-                f"  · 최후: ext4.vhdx 를 다른 폴더로 백업(이름 변경)한 뒤 "
-                f"{drive}\\kali-final.tar 로 재등록 (원본 VHDX 덮어쓰기 금지)"
+                "  · 런처가 제안하면: ext4.vhdx → ext4.vhdx.bak-* 이름 변경 후 "
+                f"{drive}\\kali-final.tar 재등록 (원본 바이트 보존)"
             )
         else:
             self.log("이 PC에서만 실패할 때 흔한 원인:")
@@ -1375,6 +1389,8 @@ class KaliLauncher:
 
                 self.diagnose_vhdx_hyperv_attach()
                 self.log("  → VHDX/HCS 부착 실패 — LxssManager 반복 재시도를 중단합니다.")
+                if self.offer_tar_reregister_after_corrupt():
+                    return True
                 break
 
             if self._is_hcs_timeout(last_detail) or wake.returncode == 124:
@@ -1384,6 +1400,138 @@ class KaliLauncher:
 
         self.log(f"  → WSL 재시작 실패: {last_detail or '(메시지 없음)'}")
         self._log_wsl_recovery_hints(last_detail)
+        return False
+
+    def offer_tar_reregister_after_corrupt(self) -> bool:
+        """
+        Ask the user before renaming the broken VHDX aside and importing kali-final.tar.
+        Never deletes the original VHDX bytes (rename-backup only).
+        """
+        if not self.config.get("offer_tar_reregister_on_corrupt", True):
+            self.log("  → tar 재등록 제안이 설정에서 꺼져 있습니다.")
+            return False
+
+        tar_path = self.paths.get("tar_path") or ""
+        install_dir = self.paths["wsl_install_dir"]
+        vhdx = find_vhdx(install_dir)
+        if not tar_path or not os.path.isfile(tar_path):
+            self.log(f"  → kali-final.tar 가 없어 재등록할 수 없습니다: {tar_path or '(없음)'}")
+            return False
+
+        bak_preview = vhdx_backup_name(install_dir)
+        prompt = (
+            "WSL이 기존 ext4.vhdx 를 붙이지 못합니다 (0x80070570).\n"
+            "경로/드라이브 문자 문제가 아닙니다.\n\n"
+            "기존 VHDX는 삭제하지 않고 이름만 바꿔 백업한 뒤,\n"
+            "kali-final.tar 로 배포판을 다시 등록할까요?\n\n"
+            f"백업(예정): {bak_preview}\n"
+            f"tar: {tar_path}\n\n"
+            "※ 백업된 VHDX 파일은 그대로 남습니다."
+        )
+        if not messagebox.askyesno(APP_NAME, prompt):
+            self.log("  → tar 재등록을 사용자가 취소했습니다. (VHDX 변경 없음)")
+            return False
+        return self.reregister_from_tar_backup_vhdx()
+
+    def reregister_from_tar_backup_vhdx(self) -> bool:
+        """
+        Rename ext4.vhdx → ext4.vhdx.bak-*, unregister distro, import tar.
+        Never deletes the renamed backup. Requires administrator.
+        """
+        if not is_admin():
+            self.log("tar 재등록에는 관리자 권한이 필요합니다. UAC에서 「예」를 눌러주세요.")
+            run_as_admin()
+            return False
+
+        install_dir = self.paths["wsl_install_dir"]
+        tar_path = self.paths["tar_path"]
+        distro = self.config["distro_name"]
+        vhdx = find_vhdx(install_dir)
+
+        if not os.path.isfile(tar_path):
+            self.log(f"  → tar 없음: {tar_path}")
+            return False
+
+        os.makedirs(install_dir, exist_ok=True)
+        self._run(["wsl", "--shutdown"], timeout=90.0)
+        time.sleep(3)
+
+        bak_path = None
+        if vhdx and os.path.isfile(vhdx):
+            bak_path = vhdx_backup_name(install_dir)
+            self.log(f"  → VHDX 백업(이름 변경, 삭제 없음):\n    {vhdx}\n    → {bak_path}")
+            try:
+                os.rename(vhdx, bak_path)
+            except OSError as exc:
+                self.log(f"  → VHDX 이름 변경 실패 (파일이 잠겼을 수 있음): {exc}")
+                self.log("  → 탐색기/백신에서 ext4.vhdx 를 닫고 다시 시도하세요.")
+                return False
+            if os.path.isfile(vhdx):
+                self.log("  → 이름 변경 후에도 ext4.vhdx 가 남아 있어 중단합니다 (덮어쓰기 방지).")
+                return False
+            if not os.path.isfile(bak_path):
+                self.log("  → 백업 파일이 확인되지 않아 중단합니다.")
+                return False
+            self.log("  → 백업 확인 OK (원본 바이트 보존)")
+        else:
+            self.log("  → 이동할 ext4.vhdx 가 없습니다. tar 재등록만 진행합니다.")
+
+        if self.wsl_distro_exists():
+            self.log(
+                f"  → 배포판 등록 해제 (백업 VHDX는 폴더에 유지): {distro}"
+            )
+            unreg = self._run(["wsl", "--unregister", distro], timeout=300.0)
+            unreg_text = ((unreg.stderr or "") + "\n" + (unreg.stdout or "")).strip()
+            if unreg.returncode != 0 and self.wsl_distro_exists():
+                self.log(f"  → unregister 실패: {unreg_text[:400] or '(출력 없음)'}")
+                # Try to restore name if we moved the vhdx and still registered.
+                if bak_path and os.path.isfile(bak_path) and not os.path.isfile(
+                    os.path.join(install_dir, VHDX_FILENAME)
+                ):
+                    try:
+                        os.rename(bak_path, os.path.join(install_dir, VHDX_FILENAME))
+                        self.log("  → 실패로 VHDX 파일명을 원래대로 복구했습니다.")
+                    except OSError:
+                        pass
+                return False
+            # Safety: never leave the user without the bak if unregister deleted something unexpected.
+            if bak_path and not os.path.isfile(bak_path):
+                self.log("  → 경고: 백업 VHDX 가 보이지 않습니다. 탐색기에서 폴더를 확인하세요.")
+
+        # Fresh import creates a new ext4.vhdx beside the .bak file.
+        self.log(f"  → tar 재등록 시작 (새 ext4.vhdx 생성, 백업 유지):\n    {tar_path}")
+        result = self._run(
+            [
+                "wsl",
+                "--import",
+                distro,
+                install_dir,
+                tar_path,
+                "--version",
+                "2",
+            ],
+            timeout=None,
+        )
+        if result.returncode != 0 and not self.wsl_distro_exists():
+            message = (result.stderr or result.stdout or "").strip()
+            self.log(f"  → tar 가져오기 실패: {message[:500] or '(출력 없음)'}")
+            return False
+
+        self.sync_portable_base_path(force=True)
+        wake = self._wake_wsl_true(timeout=180.0)
+        wake_text = f"{wake.stdout}\n{wake.stderr}"
+        if wake.returncode == 0 and not self._wsl_output_unhealthy(wake_text):
+            self.log("  → tar 재등록 후 WSL 기동 OK")
+            if bak_path:
+                self.log(f"  → 이전 VHDX 백업 위치: {bak_path}")
+            self.log(
+                f"  → 참고: tar 기본 사용자가 다를 수 있습니다. "
+                f"설정 wsl_user={self.config.get('wsl_user')} 를 확인하세요."
+            )
+            return True
+
+        detail = (wake.stderr or wake.stdout or "").strip()
+        self.log(f"  → tar 재등록 후 기동 실패: {detail[:500] or '(메시지 없음)'}")
         return False
 
     def ensure_wsl_healthy(self) -> bool:
@@ -1405,8 +1553,8 @@ class KaliLauncher:
             return True
         self.log("오류: WSL이 정상 상태로 복구되지 않았습니다.")
         self.log("  시작 버튼을 반복하지 말고, SSD 연결 확인 후 PC를 재부팅하세요.")
-        self.log("  MountDisk/0x80070570 이면 NTFS 압축 해제 후 다시 시도하세요 (VHDX 삭제 금지).")
-        self.log("  계속 HCS_E_CONNECTION_TIMEOUT이면 ext4.vhdx 점검 또는 tar 재등록이 필요할 수 있습니다.")
+        self.log("  MountDisk/0x80070570 + BasePath 일치 = VHDX/HCS 부착 실패 (경로 문제 아님).")
+        self.log("  다음 시작에서 tar 재등록(VHDX는 .bak 이름 변경 백업)을 제안할 수 있습니다.")
         return False
 
     def shutdown_wsl(self) -> None:
@@ -2337,7 +2485,7 @@ class KaliLauncher:
         self._busy = True
         try:
             self.log("=" * 42)
-            self.log(f"{APP_NAME} 시작")
+            self.log(f"{APP_NAME} 시작  (런처 v{APP_VERSION})")
             self.log(f"앱 경로: {self.paths['app_dir']}")
             self.log(f"WSL 설치 경로: {self.paths['wsl_install_dir']}")
             app_drive = windows_drive_letter(self.paths["app_dir"])
@@ -2346,10 +2494,18 @@ class KaliLauncher:
             vhdx = find_vhdx(self.paths["wsl_install_dir"])
             if vhdx:
                 self.log(f"VHDX: {vhdx} (보존)")
+            tar_path = self.paths.get("tar_path") or ""
+            if tar_path:
+                tar_state = "있음" if os.path.isfile(tar_path) else "없음"
+                self.log(f"tar: {tar_path} ({tar_state})")
             self.log(f"배포판: {self.config['distro_name']} / 사용자: {self.config['wsl_user']}")
             self.log("알림: ext4.vhdx 를 삭제/교체하거나 새 Kali를 받지 않습니다. 외장 SSD의 그 환경을 그대로 씁니다.")
             self.log("알림: 시작 중 탐색기에서 \\\\wsl$ / Linux 아이콘 / ext4.vhdx 를 열지 마세요.")
             self.log("알림: 외장 SSD의 VHDX는 첫 기동이 느릴 수 있습니다. 명령이 길면 HCS 대기일 수 있습니다.")
+            self.log(
+                "알림: MountDisk/0x80070570 이고 BasePath가 맞으면 "
+                "VHDX 부착 실패입니다. (필요 시 tar 재등록 제안 · 원본은 .bak 으로 보존)"
+            )
 
             # Always align WSL BasePath to this PC's drive letter before health checks.
             if self.wsl_distro_exists() and not self.sync_portable_base_path():
