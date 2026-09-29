@@ -153,6 +153,24 @@ class DriveRemapTests(unittest.TestCase):
         self.assertEqual(path, r"H:\0.Kali\kali-portable\ext4.vhdx.bak-20260929-010203")
         self.assertFalse(path.endswith("ext4.vhdx"))
 
+    def test_list_vhdx_bak_largest_first(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from kali_launcher import list_vhdx_bak_candidates
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            small = root / "ext4.vhdx.bak-small"
+            large = root / "ext4.vhdx.bak-20260929-101419"
+            small.write_bytes(b"x" * 100)
+            large.write_bytes(b"y" * 500)
+            (root / "notes.txt").write_text("ignore")
+            ranked = list_vhdx_bak_candidates(str(root))
+            self.assertEqual(len(ranked), 2)
+            self.assertTrue(ranked[0][0].endswith("ext4.vhdx.bak-20260929-101419"))
+            self.assertGreater(ranked[0][1], ranked[1][1])
+
     def test_config_path_remaps_stale_drive(self) -> None:
         from unittest.mock import patch
 

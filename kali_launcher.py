@@ -29,7 +29,7 @@ from tkinter import messagebox, scrolledtext, ttk
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Kali Linux Portable"
-APP_VERSION = "1.2.22"
+APP_VERSION = "1.2.23"
 LXSS_REG_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss"
 DEFAULT_DISTRO = "kali-linux"
 DEFAULT_USER = "kali"
@@ -864,6 +864,34 @@ def vhdx_backup_name(install_dir: str, stamp: str | None = None) -> str:
     return os.path.join(base, name)
 
 
+def list_vhdx_bak_candidates(install_dir: str) -> list[tuple[str, int]]:
+    """
+    Return [(path, size_bytes), ...] for ext4.vhdx.bak-* files.
+    Largest first — the old portable disk is usually much bigger than a fresh tar import.
+    """
+    if not install_dir or not os.path.isdir(install_dir):
+        return []
+    found: list[tuple[str, int]] = []
+    try:
+        names = os.listdir(install_dir)
+    except OSError:
+        return []
+    for name in names:
+        lower = name.lower()
+        if not (lower.startswith("ext4.vhdx.bak-") or lower.startswith("ext4.vhdx.bak.")):
+            continue
+        path = os.path.join(install_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        found.append((path, size))
+    found.sort(key=lambda item: item[1], reverse=True)
+    return found
+
+
 # ---------------------------------------------------------------------------
 # WSL / X 서버 / KeX
 # ---------------------------------------------------------------------------
@@ -1521,6 +1549,113 @@ class KaliLauncher:
 
         self.log(f"  → WSL 재시작 실패: {last_detail or '(메시지 없음)'}")
         self._log_wsl_recovery_hints(last_detail)
+        return False
+
+    def restore_previous_vhdx_from_bak(self) -> bool:
+        """
+        Swap the current (usually tar-imported) ext4.vhdx aside and put the
+        largest ext4.vhdx.bak-* back as ext4.vhdx, then try to wake WSL.
+        Never deletes either file.
+        """
+        install_dir = self.paths["wsl_install_dir"]
+        candidates = list_vhdx_bak_candidates(install_dir)
+        if not candidates:
+            self.log("  → 복원할 ext4.vhdx.bak-* 파일이 없습니다.")
+            messagebox.showwarning(
+                APP_NAME,
+                "kali-portable 폴더에 ext4.vhdx.bak-* 파일이 없습니다.\n"
+                "이전 디스크 백업이 있는지 탐색기에서 확인하세요.",
+            )
+            return False
+
+        bak_path, bak_size = candidates[0]
+        current = find_vhdx(install_dir)
+        cur_size = 0
+        if current:
+            try:
+                cur_size = os.path.getsize(current)
+            except OSError:
+                cur_size = 0
+
+        bak_gb = bak_size / (1024**3)
+        cur_gb = cur_size / (1024**3) if current else 0.0
+        prompt = (
+            "이전(백업) VHDX로 되돌릴까요?\n\n"
+            f"복원(이전 디스크):\n  {os.path.basename(bak_path)}\n"
+            f"  ≈ {bak_gb:.1f} GB\n\n"
+        )
+        if current:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            aside = f"ext4.vhdx.from-tar-{stamp}"
+            prompt += (
+                f"지금 사용 중(tar로 새로 만든 것)은 삭제하지 않고 이름만 바꿉니다:\n"
+                f"  ext4.vhdx → {aside}\n"
+                f"  ≈ {cur_gb:.1f} GB\n\n"
+            )
+        else:
+            aside = None
+            prompt += "현재 ext4.vhdx 가 없어 백업만 다시 올립니다.\n\n"
+        prompt += "※ 두 파일 모두 삭제하지 않습니다."
+
+        if not messagebox.askyesno(APP_NAME, prompt):
+            self.log("  → 이전 VHDX 복원을 사용자가 취소했습니다.")
+            return False
+
+        self.log("이전 VHDX 복원 시작 (삭제 없음)")
+        self.log(f"  → 복원 대상: {bak_path} ({bak_size // (1024*1024)} MB)")
+        self._run(["wsl", "--shutdown"], timeout=90.0)
+        time.sleep(3)
+
+        if current and os.path.isfile(current):
+            aside_path = os.path.join(install_dir, aside)  # type: ignore[arg-type]
+            self.log(f"  → 현재 VHDX 보관: {current}\n    → {aside_path}")
+            try:
+                os.rename(current, aside_path)
+            except OSError as exc:
+                self.log(f"  → 현재 VHDX 이름 변경 실패: {exc}")
+                return False
+
+        target = os.path.join(install_dir, VHDX_FILENAME)
+        if os.path.isfile(target):
+            self.log("  → 대상 경로에 ext4.vhdx 가 아직 있어 중단합니다 (덮어쓰기 방지).")
+            return False
+
+        self.log(f"  → 이전 디스크 복원: {bak_path}\n    → {target}")
+        try:
+            os.rename(bak_path, target)
+        except OSError as exc:
+            self.log(f"  → 백업 VHDX 복원 실패: {exc}")
+            # Try to undo aside rename
+            if current and aside:
+                aside_path = os.path.join(install_dir, aside)
+                if os.path.isfile(aside_path) and not os.path.isfile(target):
+                    try:
+                        os.rename(aside_path, target)
+                        self.log("  → 실패로 현재 VHDX 이름을 원래대로 되돌렸습니다.")
+                    except OSError:
+                        pass
+            return False
+
+        if not os.path.isfile(target):
+            self.log("  → 복원 후 ext4.vhdx 가 확인되지 않습니다.")
+            return False
+
+        self.sync_portable_base_path(force=True)
+        self.log("  → 이전 VHDX로 WSL 기동 시도...")
+        wake = self._wake_wsl_true(timeout=180.0)
+        wake_text = f"{wake.stdout}\n{wake.stderr}"
+        if wake.returncode == 0 and not self._wsl_output_unhealthy(wake_text):
+            self.log("  → 이전 VHDX 기동 OK. 「Kali Linux 시작」을 눌러 세션을 여세요.")
+            self.log("  → /home 작업 파일이 이 디스크에 있어야 합니다.")
+            return True
+
+        detail = (wake.stderr or wake.stdout or "").strip()
+        self.log(f"  → 이전 VHDX 기동 실패: {detail[:500] or '(메시지 없음)'}")
+        if self._is_vhdx_corrupt_mount(detail):
+            self.log(
+                "  → 여전히 MountDisk/0x80070570 입니다. "
+                "파일이 남아 있으니 예전에 되던 PC에서 같은 .bak/복원 파일을 시험해 보세요."
+            )
         return False
 
     def offer_tar_reregister_after_corrupt(self) -> bool:
@@ -2931,6 +3066,12 @@ class LauncherApp(tk.Tk):
 
         ttk.Button(
             btn_row,
+            text="이전 VHDX 복원",
+            command=self.on_restore_previous_vhdx,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Button(
+            btn_row,
             text="손상 복구(tar)",
             command=self.on_reregister_from_tar,
         ).pack(side=tk.LEFT)
@@ -2996,8 +3137,11 @@ class LauncherApp(tk.Tk):
             self.append_log(f"  → {p.get('base_dir', '')}\\{DEFAULT_TAR_FILENAME} 에 두었는지 확인하세요.")
         self.append_log("「Kali Linux 시작」 / 「Kali Linux 정지」 버튼을 사용하세요.")
         self.append_log(
-            "MountDisk/0x80070570 만 계속되면 「손상 복구(tar)」는 선택 사항입니다 "
-            "(VHDX/tar를 굳이 바꿀 필요 없음 · 최후 수단)."
+            "홈 파일을 되찾으려면 「이전 VHDX 복원」으로 ext4.vhdx.bak-* 를 다시 올리세요 "
+            "(지금 tar로 만든 VHDX는 이름만 바꿔 보관)."
+        )
+        self.append_log(
+            "MountDisk/0x80070570 만 계속되면 「손상 복구(tar)」는 최후 수단입니다."
         )
         self.append_log("")
 
@@ -3050,6 +3194,27 @@ class LauncherApp(tk.Tk):
         def worker():
             try:
                 self.launcher.stop_session()
+            except Exception as exc:
+                self.append_log(f"예외 발생: {exc}")
+            finally:
+                self.after(0, lambda: self._set_busy(False))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_restore_previous_vhdx(self) -> None:
+        if self.launcher._busy:
+            messagebox.showwarning("알림", "다른 작업이 진행 중입니다.")
+            return
+        self._set_busy(True)
+        self.append_log("\n--- 이전 VHDX 복원 ---")
+
+        def worker():
+            try:
+                ok = self.launcher.restore_previous_vhdx_from_bak()
+                if ok:
+                    self.append_log("  → 복원 후 「Kali Linux 시작」을 눌러보세요.")
+                else:
+                    self.append_log("  → 복원이 완료되지 않았습니다. 로그를 확인하세요.")
             except Exception as exc:
                 self.append_log(f"예외 발생: {exc}")
             finally:

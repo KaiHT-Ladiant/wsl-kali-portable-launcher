@@ -8,7 +8,7 @@
   <a href="https://github.com/KaiHT-Ladiant/wsl-kali-portable-launcher/releases"><img src="https://img.shields.io/github/v/release/KaiHT-Ladiant/wsl-kali-portable-launcher?label=Release&color=blue" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
   <a href="CONTRIBUTORS.md"><img src="https://img.shields.io/badge/Maintainer-Kai__HT-0a7ea4" alt="Maintainer Kai_HT"></a>
-  <img src="https://img.shields.io/badge/Version-1.2.22-blue" alt="Version 1.2.22">
+  <img src="https://img.shields.io/badge/Version-1.2.23-blue" alt="Version 1.2.23">
 </p>
 
 A Windows GUI client for running **WSL Kali Linux** from a portable external SSD.  
@@ -104,6 +104,7 @@ Create `kali_launcher_config.json` next to the executable (local only — not in
 | Works on another PC, fails on this PC | Drive letter / WSL `BasePath` mismatch. v1.2.17+ remaps to the exe drive (never deletes the VHDX). |
 | `MountDisk` / `0x80070570` | Not a path bug when BasePath matches. Optional last resort: **손상 복구(tar)** renames `ext4.vhdx` → `.bak-*` and imports local `kali-final.tar`. |
 | After tar import, Win-KeX missing | v1.2.22+ installs `kali-win-kex` inside the same VHDX (package only — not a new Kali download). |
+| Want old `/home` files back after tar import | Use **이전 VHDX 복원** (v1.2.23+): moves the new `ext4.vhdx` aside and restores the largest `ext4.vhdx.bak-*`. |
 | `HCS_E_CONNECTION_TIMEOUT` / Explorer freezes | Do **not** spam Start. `wsl --shutdown`, avoid `\\wsl$`, reboot once. |
 | TigerVNC `localhost:1` refused after "완료" | Fixed in v1.2.14 — server is kept running when connecting. |
 
