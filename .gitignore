@@ -6,6 +6,12 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+*.pyc
+
+# Local caches / editor junk
+.cursor/
+*.log
+.pytest_cache/
 
 # PyInstaller build output
 build/

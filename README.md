@@ -1,11 +1,20 @@
 # Kali Linux Portable Launcher
 
-![Version](https://img.shields.io/badge/Version-1.2.5-blue) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+<p align="center">
+  <img src="kali_icon.png" alt="Kali Linux Portable" width="220">
+</p>
+
+<p align="center">
+  <a href="https://github.com/KaiHT-Ladiant/wsl-kali-portable-launcher/releases"><img src="https://img.shields.io/github/v/release/KaiHT-Ladiant/wsl-kali-portable-launcher?label=Release&color=blue" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+  <a href="CONTRIBUTORS.md"><img src="https://img.shields.io/badge/Maintainer-Kai__HT-0a7ea4" alt="Maintainer Kai_HT"></a>
+  <img src="https://img.shields.io/badge/Version-1.2.22-blue" alt="Version 1.2.22">
+</p>
 
 A Windows GUI client for running **WSL Kali Linux** from a portable external SSD.  
 Start and stop Win-KeX (TigerVNC) sessions with one click.
 
-![Kali Linux Portable](kali_icon.png)
+Maintained by **[Kai_HT](https://github.com/KaiHT-Ladiant)** — see [CONTRIBUTORS.md](CONTRIBUTORS.md).
 
 ## Features
 
@@ -30,12 +39,12 @@ Start and stop Win-KeX (TigerVNC) sessions with one click.
 ## Recommended folder layout (external SSD)
 
 ```
-D:\kali-setup\                    <- drive letter may vary
-├── kali-rootfs.tar               <- optional, for first WSL import (not included in repo)
+H:\0.Kali\                        <- drive letter may vary (F:, H:, …)
+├── kali-final.tar                <- optional, for first/repair WSL import (local only)
+├── KaliLauncher.exe              <- from GitHub Releases
+├── kali_icon.ico                 <- optional, for shortcuts
 └── kali-portable\
-    ├── KaliLauncher.exe          <- from Releases
-    ├── kali_icon.ico             <- optional, for shortcuts
-    └── (WSL ext4.vhdx, etc.)     <- created locally, never committed
+    └── ext4.vhdx                 <- created locally, never committed
 ```
 
 The launcher resolves paths from its own location. Running from `dist\` or the project root both work.
@@ -44,14 +53,15 @@ The launcher resolves paths from its own location. Running from `dist\` or the p
 
 ### Option 1: Release executable (recommended)
 
-1. Download `KaliLauncher.exe` from [Releases](../../releases)
-2. Place it in your `kali-portable` folder
+1. Download `KaliLauncher.exe` from [Releases](https://github.com/KaiHT-Ladiant/wsl-kali-portable-launcher/releases)
+2. Place it in your `0.Kali` / `kali-portable` folder (replace the old exe)
 3. Run it and click **Start Kali Linux**
+
+> Fixes land on GitHub first. The copy on your external SSD does **not** update until you replace that `.exe` (or rebuild with `build_exe.bat`).
 
 ### Option 2: Build from source
 
 ```bat
-cd kali-portable
 build_exe.bat
 ```
 
@@ -73,7 +83,7 @@ python kali_launcher.py
 
 ## Configuration
 
-Create `kali_launcher_config.json` next to the executable (this file is local and not part of the repository):
+Create `kali_launcher_config.json` next to the executable (local only — not in this repository):
 
 ```json
 {
@@ -91,21 +101,30 @@ Create `kali_launcher_config.json` next to the executable (this file is local an
 | Symptom | Action |
 |---------|--------|
 | TigerVNC window does not appear | Run `kex --passwd` in WSL, then restart |
-| Xfce notification daemon error | Harmless; disabled automatically in v1.0.7+ |
-| WSL import fails | Run the launcher as administrator |
-| Connection refused on VNC port | Confirm `kex_vnc_port` is `5901` |
-| Fails after unplugging external SSD | Use **Stop Kali Linux** first (v1.2.5+ shuts down WSL). If it still fails, restart the launcher — it auto-recovers. |
-| `/tmp/.X11-unix` read-only / VNC never starts | Fixed automatically in v1.2.5 via root remount after WSL health check |
+| Works on another PC, fails on this PC | Drive letter / WSL `BasePath` mismatch. v1.2.17+ remaps to the exe drive (never deletes the VHDX). |
+| `MountDisk` / `0x80070570` | Not a path bug when BasePath matches. Optional last resort: **손상 복구(tar)** renames `ext4.vhdx` → `.bak-*` and imports local `kali-final.tar`. |
+| After tar import, Win-KeX missing | v1.2.22+ installs `kali-win-kex` inside the same VHDX (package only — not a new Kali download). |
+| `HCS_E_CONNECTION_TIMEOUT` / Explorer freezes | Do **not** spam Start. `wsl --shutdown`, avoid `\\wsl$`, reboot once. |
+| TigerVNC `localhost:1` refused after "완료" | Fixed in v1.2.14 — server is kept running when connecting. |
+
+## Releases
+
+Binary releases are published on the [Releases](https://github.com/KaiHT-Ladiant/wsl-kali-portable-launcher/releases) page by **Kai_HT**.  
+Tagging `v*` on `main` builds `KaliLauncher.exe` via GitHub Actions and attaches it to the release.
+
+## Contributors
+
+| Name | GitHub | Role |
+|------|--------|------|
+| Kai_HT | [@KaiHT-Ladiant](https://github.com/KaiHT-Ladiant) | Author and maintainer |
+
+See [CONTRIBUTORS.md](CONTRIBUTORS.md) for contributing notes. Automated assist commits are not listed as maintainers.
 
 ## Tech stack
 
 - Python 3 + Tkinter
 - WSL2 + Win-KeX 3.x
 - PyInstaller (single-file executable)
-
-## Contributors
-
-See [CONTRIBUTORS.md](CONTRIBUTORS.md). Maintained by [@KaiHT-Ladiant](https://github.com/KaiHT-Ladiant).
 
 ## License
 
