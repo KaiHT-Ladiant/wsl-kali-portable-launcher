@@ -29,7 +29,7 @@ from tkinter import messagebox, scrolledtext, ttk
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Kali Linux Portable"
-APP_VERSION = "1.2.19"
+APP_VERSION = "1.2.20"
 LXSS_REG_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss"
 DEFAULT_DISTRO = "kali-linux"
 DEFAULT_USER = "kali"
@@ -40,6 +40,7 @@ DEFAULT_TAR_FILENAME = "kali-final.tar"
 TAR_FILENAMES = (DEFAULT_TAR_FILENAME, "kali-fresh.tar", "kali-wsl.tar")
 VHDX_FILENAME = "ext4.vhdx"
 # Never unregister / never delete VHDX. Portable disks must survive PC moves.
+REREGISTER_FROM_TAR_ARG = "--reregister-from-tar"
 
 VCXSRV_CANDIDATES = [
     r"C:\Program Files\VcXsrv\vcxsrv.exe",
@@ -289,8 +290,8 @@ def load_config(paths: dict) -> dict:
         "recover_wsl_on_start": True,
         "shutdown_wsl_on_stop": True,
         "auto_install_winkex": False,
-        # Prompt to rename-backup broken ext4.vhdx and re-import from kali-final.tar
-        "offer_tar_reregister_on_corrupt": True,
+        # Auto-prompt during Start is off by default (user can use the button).
+        "offer_tar_reregister_on_corrupt": False,
         "vcxsrv_extra_args": [":0", "-multiwindow", "-clipboard", "-primary", "-wgl", "-dpi", "auto"],
     }
     cfg_path = paths["config_path"]
@@ -323,13 +324,16 @@ def is_admin() -> bool:
         return False
 
 
-def run_as_admin() -> None:
+def run_as_admin(extra_args: list[str] | None = None) -> None:
+    """Relaunch this process elevated. Optional extra_args are appended (exe) or after script path."""
+    extras = list(extra_args or [])
     if getattr(sys, "frozen", False):
         target = sys.executable
-        params = ""
+        params = subprocess.list2cmdline(extras) if extras else ""
     else:
         target = sys.executable
-        params = f'"{os.path.abspath(__file__)}"'
+        script = os.path.abspath(__file__)
+        params = subprocess.list2cmdline([script, *extras])
     ctypes.windll.shell32.ShellExecuteW(None, "runas", target, params, None, 1)
 
 
@@ -1389,8 +1393,13 @@ class KaliLauncher:
 
                 self.diagnose_vhdx_hyperv_attach()
                 self.log("  → VHDX/HCS 부착 실패 — LxssManager 반복 재시도를 중단합니다.")
-                if self.offer_tar_reregister_after_corrupt():
-                    return True
+                self.log(
+                    "  → 기존 ext4.vhdx / kali-final.tar 는 그대로 두셔도 됩니다. "
+                    "필요하면 「손상 복구(tar)」 버튼만 사용하세요."
+                )
+                if self.config.get("offer_tar_reregister_on_corrupt", False):
+                    if self.offer_tar_reregister_after_corrupt():
+                        return True
                 break
 
             if self._is_hcs_timeout(last_detail) or wake.returncode == 124:
@@ -1407,13 +1416,8 @@ class KaliLauncher:
         Ask the user before renaming the broken VHDX aside and importing kali-final.tar.
         Never deletes the original VHDX bytes (rename-backup only).
         """
-        if not self.config.get("offer_tar_reregister_on_corrupt", True):
-            self.log("  → tar 재등록 제안이 설정에서 꺼져 있습니다.")
-            return False
-
         tar_path = self.paths.get("tar_path") or ""
         install_dir = self.paths["wsl_install_dir"]
-        vhdx = find_vhdx(install_dir)
         if not tar_path or not os.path.isfile(tar_path):
             self.log(f"  → kali-final.tar 가 없어 재등록할 수 없습니다: {tar_path or '(없음)'}")
             return False
@@ -1426,7 +1430,8 @@ class KaliLauncher:
             "kali-final.tar 로 배포판을 다시 등록할까요?\n\n"
             f"백업(예정): {bak_preview}\n"
             f"tar: {tar_path}\n\n"
-            "※ 백업된 VHDX 파일은 그대로 남습니다."
+            "※ 백업된 VHDX 파일은 그대로 남습니다.\n"
+            "※ 「예」를 누르면 관리자 권한으로 다시 열린 뒤 이어서 진행합니다."
         )
         if not messagebox.askyesno(APP_NAME, prompt):
             self.log("  → tar 재등록을 사용자가 취소했습니다. (VHDX 변경 없음)")
@@ -1439,8 +1444,12 @@ class KaliLauncher:
         Never deletes the renamed backup. Requires administrator.
         """
         if not is_admin():
-            self.log("tar 재등록에는 관리자 권한이 필요합니다. UAC에서 「예」를 눌러주세요.")
-            run_as_admin()
+            self.log(
+                "tar 재등록에는 관리자 권한이 필요합니다. "
+                "UAC에서 「예」를 누르면 관리자 창에서 이어서 진행합니다."
+            )
+            run_as_admin([REREGISTER_FROM_TAR_ARG])
+            self.log("  → 관리자 권한 창이 열리면 그쪽에서 재등록이 이어집니다. 이 창은 대기하세요.")
             return False
 
         install_dir = self.paths["wsl_install_dir"]
@@ -1484,7 +1493,6 @@ class KaliLauncher:
             unreg_text = ((unreg.stderr or "") + "\n" + (unreg.stdout or "")).strip()
             if unreg.returncode != 0 and self.wsl_distro_exists():
                 self.log(f"  → unregister 실패: {unreg_text[:400] or '(출력 없음)'}")
-                # Try to restore name if we moved the vhdx and still registered.
                 if bak_path and os.path.isfile(bak_path) and not os.path.isfile(
                     os.path.join(install_dir, VHDX_FILENAME)
                 ):
@@ -1494,11 +1502,9 @@ class KaliLauncher:
                     except OSError:
                         pass
                 return False
-            # Safety: never leave the user without the bak if unregister deleted something unexpected.
             if bak_path and not os.path.isfile(bak_path):
                 self.log("  → 경고: 백업 VHDX 가 보이지 않습니다. 탐색기에서 폴더를 확인하세요.")
 
-        # Fresh import creates a new ext4.vhdx beside the .bak file.
         self.log(f"  → tar 재등록 시작 (새 ext4.vhdx 생성, 백업 유지):\n    {tar_path}")
         result = self._run(
             [
@@ -2504,7 +2510,8 @@ class KaliLauncher:
             self.log("알림: 외장 SSD의 VHDX는 첫 기동이 느릴 수 있습니다. 명령이 길면 HCS 대기일 수 있습니다.")
             self.log(
                 "알림: MountDisk/0x80070570 이고 BasePath가 맞으면 "
-                "VHDX 부착 실패입니다. (필요 시 tar 재등록 제안 · 원본은 .bak 으로 보존)"
+                "VHDX 부착 실패입니다. tar/VHDX를 굳이 바꾸지 마세요. "
+                "최후 수단만 「손상 복구(tar)」 버튼."
             )
 
             # Always align WSL BasePath to this PC's drive letter before health checks.
@@ -2589,6 +2596,8 @@ class LauncherApp(tk.Tk):
         self.mode_var.set(self.config.get("session_mode", "win"))
         self._update_mode_description()
         self._show_paths_on_start()
+        if REREGISTER_FROM_TAR_ARG in sys.argv:
+            self.after(300, self._auto_reregister_from_tar_arg)
 
     def _setup_style(self) -> None:
         style = ttk.Style(self)
@@ -2681,6 +2690,12 @@ class LauncherApp(tk.Tk):
             btn_row,
             text="경로 새로고침",
             command=self.on_refresh_paths,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Button(
+            btn_row,
+            text="손상 복구(tar)",
+            command=self.on_reregister_from_tar,
         ).pack(side=tk.LEFT)
 
         self.log_box = scrolledtext.ScrolledText(
@@ -2742,7 +2757,12 @@ class LauncherApp(tk.Tk):
         self.append_log(f"세션 모드: {session_mode_label(mode)}  →  kex {' '.join(resolve_kex_args(self.config))}")
         if not tar_exists:
             self.append_log(f"  → {p.get('base_dir', '')}\\{DEFAULT_TAR_FILENAME} 에 두었는지 확인하세요.")
-        self.append_log("「Kali Linux 시작」 / 「Kali Linux 정지」 버튼을 사용하세요.\n")
+        self.append_log("「Kali Linux 시작」 / 「Kali Linux 정지」 버튼을 사용하세요.")
+        self.append_log(
+            "MountDisk/0x80070570 만 계속되면 「손상 복구(tar)」는 선택 사항입니다 "
+            "(VHDX/tar를 굳이 바꿀 필요 없음 · 최후 수단)."
+        )
+        self.append_log("")
 
     def on_refresh_paths(self) -> None:
         self.paths = resolve_paths()
@@ -2793,6 +2813,60 @@ class LauncherApp(tk.Tk):
         def worker():
             try:
                 self.launcher.stop_session()
+            except Exception as exc:
+                self.append_log(f"예외 발생: {exc}")
+            finally:
+                self.after(0, lambda: self._set_busy(False))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_reregister_from_tar(self) -> None:
+        if self.launcher._busy:
+            messagebox.showwarning("알림", "다른 작업이 진행 중입니다.")
+            return
+        self._set_busy(True)
+        self.append_log("\n--- 손상 복구(tar) 수동 실행 ---")
+
+        def worker():
+            try:
+                ok = self.launcher.offer_tar_reregister_after_corrupt()
+                if ok:
+                    self.append_log("  → 재등록 성공. 「Kali Linux 시작」을 다시 눌러보세요.")
+                elif is_admin():
+                    self.append_log("  → 재등록이 완료되지 않았습니다. 로그를 확인하세요.")
+            except Exception as exc:
+                self.append_log(f"예외 발생: {exc}")
+            finally:
+                self.after(0, lambda: self._set_busy(False))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _auto_reregister_from_tar_arg(self) -> None:
+        """Continue tar re-register after UAC elevation relaunch."""
+        if not is_admin():
+            self.append_log(
+                "관리자 권한이 없어 tar 재등록을 이어갈 수 없습니다. "
+                "「손상 복구(tar)」를 다시 누르고 UAC에서 「예」를 선택하세요."
+            )
+            return
+        self.append_log("\n--- 관리자 권한으로 tar 재등록 이어가기 ---")
+        self._set_busy(True)
+
+        def worker():
+            try:
+                # Already confirmed before elevation; do not ask again.
+                ok = self.launcher.reregister_from_tar_backup_vhdx()
+                if ok:
+                    self.append_log("  → 재등록 성공. 「Kali Linux 시작」을 눌러보세요.")
+                    self.after(
+                        0,
+                        lambda: messagebox.showinfo(
+                            APP_NAME,
+                            "tar 재등록이 완료되었습니다.\n「Kali Linux 시작」을 눌러주세요.",
+                        ),
+                    )
+                else:
+                    self.append_log("  → 재등록 실패. 로그를 확인하세요.")
             except Exception as exc:
                 self.append_log(f"예외 발생: {exc}")
             finally:
